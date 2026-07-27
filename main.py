@@ -1,4 +1,3 @@
-
 import tkinter as tk
 from tkinter import messagebox, ttk
 from datetime import datetime
@@ -9,6 +8,7 @@ from urllib.request import Request, urlopen
 
 from core.runner import abrir_planilha, executar_script, logger
 from services.storage import (
+    atualizar_campos_registro,
     carregar_config,
     carregar_estado_app,
     carregar_historico,
@@ -17,6 +17,7 @@ from services.storage import (
     salvar_estado_app,
     salvar_login,
 )
+from ui import theme
 from ui.theme import (
     ACCENT,
     ACCENT_SOFT,
@@ -80,7 +81,6 @@ class PhoenixTool:
     def __init__(self, root):
         self.root = root
         self.root.title("Phoenix Tool")
-        self.root.configure(bg=BG)
         self.root.resizable(True, True)
         self.root.minsize(560, 720)
         self.root.state("zoomed")
@@ -100,18 +100,44 @@ class PhoenixTool:
         self._cards = {}
         self._active_card_key = None
 
+        estado_inicial = carregar_estado_app()
+        theme.definir_tema(estado_inicial.get("theme") or theme.TEMA_ESCURO)
+        self._sincronizar_cores()
+
+        self.root.configure(bg=BG)
+        self._montar_estrutura_chrome()
+
+        self._build_login()
+        self._show_loading_state()
+        self.root.after(350, self._finalizar_inicializacao)
+
+    def _sincronizar_cores(self):
+        """Copia as cores atuais de ui.theme para as constantes usadas em main.py."""
+        global BG, BG_CARD, BORDA, TEXTO, TEXTO_MUTED, ACCENT, ACCENT_SOFT, HEADER_BG, FOOTER_BG
+        BG = theme.BG
+        BG_CARD = theme.BG_CARD
+        BORDA = theme.BORDA
+        TEXTO = theme.TEXTO
+        TEXTO_MUTED = theme.TEXTO_MUTED
+        ACCENT = theme.ACCENT
+        ACCENT_SOFT = theme.ACCENT_SOFT
+        HEADER_BG = theme.HEADER_BG
+        FOOTER_BG = theme.FOOTER_BG
+
+    def _montar_estrutura_chrome(self):
         self._aplicar_estilo()
 
-        self.header = tk.Frame(root, bg=HEADER_BG, height=52, highlightbackground=BORDA, highlightthickness=0)
+        self.header = tk.Frame(self.root, bg=HEADER_BG, height=52, highlightbackground=BORDA, highlightthickness=0)
         self.header.pack(fill="x", side="top")
         self.header.pack_propagate(False)
 
-        tk.Label(self.header, text="ACME • PHOENIX TOOL", bg=HEADER_BG, fg=ACCENT, font=("Arial", 10, "bold")).pack(side="left", padx=18)
-        self.user_badge = tk.Label(self.header, text="USUÁRIO: NÃO LOGADO", bg=HEADER_BG, fg=TEXTO_MUTED, font=("Arial", 8))
+        tk.Label(self.header, text="FLEX • CLASSIFICAÇÃO FISCAL", bg=HEADER_BG, fg=ACCENT, font=("Arial", 10, "bold")).pack(side="left", padx=18)
+        texto_badge = f"USUÁRIO: {self.usuario.upper()}" if self.usuario else "USUÁRIO: NÃO LOGADO"
+        self.user_badge = tk.Label(self.header, text=texto_badge, bg=HEADER_BG, fg=TEXTO_MUTED, font=("Arial", 8))
         self.user_badge.pack(side="left", padx=(12, 0))
         tk.Label(self.header, text="STATUS: ONLINE", bg=HEADER_BG, fg=TEXTO_MUTED, font=("Arial", 9)).pack(side="right", padx=18)
 
-        self.footer = tk.Frame(root, bg=FOOTER_BG, height=30, highlightbackground=BORDA, highlightthickness=0)
+        self.footer = tk.Frame(self.root, bg=FOOTER_BG, height=30, highlightbackground=BORDA, highlightthickness=0)
         self.footer.pack(fill="x", side="bottom")
         self.footer.pack_propagate(False)
 
@@ -132,21 +158,56 @@ class PhoenixTool:
         tk.Label(nav_right, text="MINIMAL", bg=FOOTER_BG, fg=TEXTO_MUTED, font=("Arial", 8)).pack(side="right")
 
         self.signature = tk.Label(
-            root,
-            text="Desenvolvido por Dev Team",
+            self.root,
+            text="Desenvolvido por Gabriell Girotto",
             bg=BG,
             fg="#6f6f6f",
             font=("Arial", 8),
         )
         self.signature.place(relx=0.5, rely=0.985, anchor="s")
 
-        self.container = tk.Frame(root, bg=BG)
-        self.container.pack(fill="both", expand=True)
-        self.container.grid_columnconfigure(0, weight=1)
+        area_rolagem = tk.Frame(self.root, bg=BG)
+        area_rolagem.pack(fill="both", expand=True)
 
-        self._build_login()
-        self._show_loading_state()
-        self.root.after(350, self._finalizar_inicializacao)
+        self.main_canvas = tk.Canvas(area_rolagem, bg=BG, highlightthickness=0, bd=0)
+        self.vscrollbar = tk.Scrollbar(area_rolagem, orient="vertical", command=self.main_canvas.yview)
+        self.hscrollbar = tk.Scrollbar(area_rolagem, orient="horizontal", command=self.main_canvas.xview)
+        self.main_canvas.configure(yscrollcommand=self.vscrollbar.set, xscrollcommand=self.hscrollbar.set)
+
+        self.vscrollbar.pack(side="right", fill="y")
+        self.hscrollbar.pack(side="bottom", fill="x")
+        self.main_canvas.pack(side="left", fill="both", expand=True)
+
+        self.container = tk.Frame(self.main_canvas, bg=BG)
+        self.container.grid_columnconfigure(0, weight=1)
+        self._container_window = self.main_canvas.create_window((0, 0), window=self.container, anchor="nw")
+
+        def _atualizar_scrollregion(event=None):
+            self.main_canvas.configure(scrollregion=self.main_canvas.bbox("all"))
+
+        def _ajustar_largura_container(event):
+            largura = max(event.width, self.container.winfo_reqwidth())
+            self.main_canvas.itemconfig(self._container_window, width=largura)
+
+        self.container.bind("<Configure>", _atualizar_scrollregion)
+        self.main_canvas.bind("<Configure>", _ajustar_largura_container)
+
+        def _scroll_vertical(event):
+            self.main_canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+
+        def _scroll_horizontal(event):
+            self.main_canvas.xview_scroll(int(-1 * (event.delta / 120)), "units")
+
+        def _bind_scroll(event=None):
+            self.main_canvas.bind_all("<MouseWheel>", _scroll_vertical)
+            self.main_canvas.bind_all("<Shift-MouseWheel>", _scroll_horizontal)
+
+        def _unbind_scroll(event=None):
+            self.main_canvas.unbind_all("<MouseWheel>")
+            self.main_canvas.unbind_all("<Shift-MouseWheel>")
+
+        self.main_canvas.bind("<Enter>", _bind_scroll)
+        self.main_canvas.bind("<Leave>", _unbind_scroll)
 
     def _build_title_bar(self, root):
         bar = tk.Frame(root, bg=HEADER_BG, height=32, highlightbackground=BORDA, highlightthickness=0)
@@ -536,7 +597,7 @@ class PhoenixTool:
         painel.pack(fill="x", padx=28, pady=(38, 16))
 
         tk.Label(
-            painel, text="ACME • OPERATIONAL TOOL", bg=BG_CARD, fg=ACCENT, font=("Arial", 9, "bold")
+            painel, text="FLEX • CLASSIFICAÇÃO FISCAL", bg=BG_CARD, fg=ACCENT, font=("Arial", 9, "bold")
         ).pack(pady=(24, 6))
 
         tk.Label(
@@ -850,7 +911,18 @@ class PhoenixTool:
             self._linha_historico(container, item)
 
     def _dashboard_signature(self, historico):
-        return tuple((str(item.get("id", "")), str(item.get("linha", "")), str(item.get("status", "")), str(item.get("description", ""))) for item in historico)
+        return tuple(
+            (
+                str(item.get("id", "")),
+                str(item.get("linha", "")),
+                str(item.get("status", "")),
+                str(item.get("description", "")),
+                str(item.get("produto", "")),
+                str(item.get("solicitante", "")),
+                str(item.get("requisitante", "")),
+            )
+            for item in historico
+        )
 
     def _check_dashboard_refresh(self):
         if self.history and self.history[-1] != FRAME_DASHBOARD:
@@ -912,10 +984,41 @@ class PhoenixTool:
                 font=("Arial", 8, "bold"),
             ).pack(side="right", padx=(0, 8), pady=10)
 
+        btn_editar = tk.Button(
+            topo,
+            text="Editar",
+            command=lambda item=item: self._abrir_editar_registro(item),
+            bg=BG_CARD,
+            fg=ACCENT,
+            activebackground=BORDA,
+            activeforeground=TEXTO,
+            relief="solid",
+            bd=1,
+            font=("Arial", 8, "bold"),
+            padx=10,
+            pady=4,
+            cursor="hand2",
+        )
+        btn_editar.pack(side="right", padx=(0, 8), pady=10)
+
         tk.Label(
             linha,
             text=f"Linha {item.get('linha', '—')}   ·   {item.get('data_abertura', '—')}"
                  f"   ·   {item.get('user', '—')}",
+            bg=BG_CARD, fg=TEXTO_MUTED, font=("Arial", 9)
+        ).pack(anchor="w", padx=12, pady=(0, 2))
+
+        solicitante = str(item.get("solicitante") or "").strip() or "Não informado"
+        requisitante = str(item.get("requisitante") or "").strip() or "Não informado"
+        produto = str(item.get("produto") or "").strip() or "Não informado"
+        tk.Label(
+            linha,
+            text=f"Produto: {produto}",
+            bg=BG_CARD, fg=TEXTO_MUTED, font=("Arial", 9)
+        ).pack(anchor="w", padx=12, pady=(0, 2))
+        tk.Label(
+            linha,
+            text=f"Solicitante: {solicitante}   ·   Requisitante: {requisitante}",
             bg=BG_CARD, fg=TEXTO_MUTED, font=("Arial", 9)
         ).pack(anchor="w", padx=12, pady=(0, 10))
 
@@ -929,11 +1032,90 @@ class PhoenixTool:
                 f"Status: {item.get('status', '—')}\n\n"
                 f"Data abertura: {item.get('data_abertura', '—')}\n\n"
                 f"PN: {item.get('pn') or '—'}\n\n"
+                f"Produto: {item.get('produto') or 'Não informado'}\n\n"
+                f"Solicitante: {item.get('solicitante') or 'Não informado'}\n\n"
+                f"Requisitante: {item.get('requisitante') or 'Não informado'}\n\n"
                 f"Usuário: {item.get('user', '—')}"
             )
 
         for widget in (linha, topo):
             widget.bind("<Button-1>", mostrar_detalhes)
+
+    def _abrir_editar_registro(self, item):
+        janela = tk.Toplevel(self.root)
+        janela.title("Editar informações do produto")
+        janela.configure(bg=BG)
+        janela.attributes("-topmost", True)
+        janela.resizable(False, False)
+        janela.transient(self.root)
+
+        corpo = tk.Frame(janela, bg=BG, padx=16, pady=16)
+        corpo.pack(fill="both", expand=True)
+
+        tk.Label(
+            corpo,
+            text=str(item.get("description") or "—").upper(),
+            bg=BG, fg=TEXTO, font=("Arial", 11, "bold"),
+        ).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 14))
+
+        tk.Label(
+            corpo, text=espacar("Produto"), bg=BG, fg=TEXTO_MUTED, font=FONT_CAPTION
+        ).grid(row=1, column=0, sticky="w", pady=(0, 6))
+        campo_produto = self.campo_entry(corpo)
+        campo_produto.grid(row=1, column=1, sticky="ew", pady=(0, 6), padx=(10, 0), ipady=4)
+        campo_produto.insert(0, str(item.get("produto") or ""))
+
+        tk.Label(
+            corpo, text=espacar("Solicitante"), bg=BG, fg=TEXTO_MUTED, font=FONT_CAPTION
+        ).grid(row=2, column=0, sticky="w", pady=(0, 6))
+        campo_solicitante = self.campo_entry(corpo)
+        campo_solicitante.grid(row=2, column=1, sticky="ew", pady=(0, 6), padx=(10, 0), ipady=4)
+        campo_solicitante.insert(0, str(item.get("solicitante") or ""))
+
+        tk.Label(
+            corpo, text=espacar("Requisitante"), bg=BG, fg=TEXTO_MUTED, font=FONT_CAPTION
+        ).grid(row=3, column=0, sticky="w", pady=(0, 6))
+        campo_requisitante = self.campo_entry(corpo)
+        campo_requisitante.grid(row=3, column=1, sticky="ew", pady=(0, 6), padx=(10, 0), ipady=4)
+        campo_requisitante.insert(0, str(item.get("requisitante") or ""))
+
+        corpo.grid_columnconfigure(1, weight=1)
+
+        botoes = tk.Frame(corpo, bg=BG)
+        botoes.grid(row=4, column=0, columnspan=2, pady=(16, 0))
+
+        def salvar():
+            novo_produto = campo_produto.get().strip()
+            novo_solicitante = campo_solicitante.get().strip()
+            novo_requisitante = campo_requisitante.get().strip()
+            atualizar_campos_registro(
+                item.get("linha"),
+                {
+                    "produto": novo_produto,
+                    "solicitante": novo_solicitante,
+                    "requisitante": novo_requisitante,
+                },
+            )
+            item["produto"] = novo_produto
+            item["solicitante"] = novo_solicitante
+            item["requisitante"] = novo_requisitante
+            janela.destroy()
+            if FRAME_DASHBOARD in self.frames:
+                historico = self._carregar_historico()
+                self._dashboard_last_signature = self._dashboard_signature(historico)
+                self._renderizar_dashboard_conteudo(self.frames[FRAME_DASHBOARD], historico)
+
+        self.botao_flat(botoes, "Salvar", salvar, largura=12).pack(side="left", padx=6)
+        self.botao_flat(botoes, "Cancelar", janela.destroy, largura=12).pack(side="left", padx=6)
+
+        janela.update_idletasks()
+        largura, altura = janela.winfo_width(), janela.winfo_height()
+        x = (janela.winfo_screenwidth() // 2) - (largura // 2)
+        y = (janela.winfo_screenheight() // 2) - (altura // 2)
+        janela.geometry(f"+{x}+{y}")
+
+        campo_solicitante.focus_set()
+        janela.grab_set()
 
    
 
