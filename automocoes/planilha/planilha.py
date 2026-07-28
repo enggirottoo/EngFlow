@@ -1,8 +1,4 @@
-"""Automação de atualização da planilha de solicitações.
 
-Tenta primeiro atualizar uma cópia local do workbook (encontrada no OneDrive);
-se não achar nenhum arquivo local, abre a planilha online no navegador como
-fallback para preenchimento manual/assistido.
 """
 
 from __future__ import annotations
