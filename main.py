@@ -7,6 +7,7 @@ from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 from core.runner import abrir_planilha, executar_script, logger
+from automocoes.phoenix.atualizar_pn import buscar_pn_por_ticket
 from services.storage import (
     atualizar_campos_registro,
     carregar_config,
@@ -16,6 +17,8 @@ from services.storage import (
     encontrar_por_linha,
     salvar_estado_app,
     salvar_login,
+    cancelar_registro,
+
 )
 from ui import theme
 from ui.theme import (
@@ -35,6 +38,12 @@ from ui.theme import (
     TEXTO_MUTED,
     espacar,
 )
+
+
+from services.database import inicializar_banco
+
+inicializar_banco()
+
 
 FRAME_LOGIN = "frame_login"
 FRAME_MENU = "frame_menu"
@@ -78,6 +87,43 @@ def resumo_ultimo_registro(historico: List[Dict[str, Any]]) -> str:
 
 
 class PhoenixTool:
+
+    def _excluir_registro(self, item):
+        confirmar = messagebox.askyesno(
+            "Excluir Registro",
+            (
+                f"Deseja excluir a linha {item.get('linha')}?\n\n"
+                f"Descrição:\n{item.get('description')}\n\n"
+                "Esta ação ocultará o registro do dashboard."
+            )
+        )
+
+        if not confirmar:
+            return
+
+        sucesso = cancelar_registro(
+            item.get("uuid"),
+            "Excluído manualmente pelo usuário",
+            usuario_cancelamento=self.usuario,
+        )
+
+        if sucesso:
+            messagebox.showinfo(
+                "Sucesso",
+                "Registro excluído com sucesso."
+        )
+
+        if FRAME_DASHBOARD in self.frames:
+            self._build_dashboard()
+            self.mostrar(FRAME_DASHBOARD)
+
+        else:
+            messagebox.showerror(
+            "Erro",
+            "Não foi possível excluir o registro."
+        )
+
+
     def __init__(self, root):
         self.root = root
         self.root.title("Phoenix Tool")
@@ -822,14 +868,6 @@ class PhoenixTool:
         self.botao_flat(topo_barra, "Atualizar", self._abrir_dashboard, largura=12).pack(side="left")
         self.botao_flat(topo_barra, "Planilha", abrir_planilha, largura=12).pack(side="left", padx=(10, 0))
 
-        tk.Label(
-            topo_barra,
-            text="● atualização automática",
-            bg=BG,
-            fg="#67d28d",
-            font=("Arial", 8, "bold"),
-        ).pack(side="left", padx=(12, 0))
-
         for texto, valor in (("Todos", "todos"), ("Em andamento", "on going"), ("Finalizadas", "finalizadas")):
             btn = tk.Button(
                 topo_barra,
@@ -848,10 +886,42 @@ class PhoenixTool:
             )
             btn.pack(side="left", padx=(12, 6) if texto == "Todos" else 6)
 
+        # Barra de Pesquisa para a Base Histórica Compartilhada (Finalizados)
+        busca_frame = tk.Frame(topo_barra, bg=BG)
+        busca_frame.pack(side="left", padx=(16, 0))
+
+        tk.Label(
+            busca_frame, text="Buscar:", bg=BG, fg=TEXTO_MUTED, font=("Arial", 9, "bold")
+        ).pack(side="left", padx=(0, 6))
+
+        self.campo_busca = tk.Entry(
+            busca_frame,
+            bg=BG_CARD,
+            fg=TEXTO,
+            insertbackground=TEXTO,
+            relief="solid",
+            font=("Arial", 9),
+            highlightbackground=BORDA,
+            highlightthickness=1,
+            bd=0,
+            width=24,
+        )
+        self.campo_busca.pack(side="left", ipady=4)
+        if hasattr(self, "_dashboard_search_query") and self._dashboard_search_query:
+            self.campo_busca.insert(0, self._dashboard_search_query)
+        self.campo_busca.bind("<KeyRelease>", lambda e: self._filtrar_busca_dashboard())
+
         historico = self._carregar_historico()
         self._dashboard_last_signature = self._dashboard_signature(historico)
         self._renderizar_dashboard_conteudo(frame, historico)
         self.root.after(2000, self._check_dashboard_refresh)
+
+    def _filtrar_busca_dashboard(self):
+        if hasattr(self, "campo_busca"):
+            self._dashboard_search_query = self.campo_busca.get().strip().lower()
+        if FRAME_DASHBOARD in self.frames:
+            historico = self._carregar_historico()
+            self._renderizar_dashboard_conteudo(self.frames[FRAME_DASHBOARD], historico)
 
     def _aplicar_filtro_dashboard(self, valor):
         self._dashboard_filter = valor
@@ -864,17 +934,33 @@ class PhoenixTool:
             if getattr(widget, "_dashboard_area", False):
                 widget.destroy()
 
+        import getpass
+        usuario_atual = (self.usuario or getpass.getuser()).strip().upper()
+
+        # Segregação: Pendentes são privados do usuário atual
+        pendentes_usuario = [
+            item for item in historico
+            if str(item.get("status", "")).upper() == "ON GOING"
+            and str(item.get("criado_por") or item.get("user") or "").strip().upper() == usuario_atual
+        ]
+
+        # Finalizadas são compartilhadas entre todos da Engenharia de Teste
+        finalizadas_todas = [
+            item for item in historico
+            if str(item.get("status", "")).upper() != "ON GOING"
+        ]
+
         stats = tk.Frame(frame, bg=BG)
         stats._dashboard_area = True
         stats.pack(fill="x", padx=28, pady=(0, 8))
 
-        total = len(historico)
-        em_andamento = sum(1 for i in historico if str(i.get("status", "")).upper() == "ON GOING")
-        finalizadas = sum(1 for i in historico if str(i.get("status", "")).upper() not in ("ON GOING", ""))
+        total_metrica = len(pendentes_usuario) + len(finalizadas_todas)
+        em_andamento_metrica = len(pendentes_usuario)
+        finalizadas_metrica = len(finalizadas_todas)
 
-        self._stat_card(stats, total, "Total")
-        self._stat_card(stats, em_andamento, "Em andamento")
-        self._stat_card(stats, finalizadas, "Finalizadas")
+        self._stat_card(stats, total_metrica, "Total (Seu)")
+        self._stat_card(stats, em_andamento_metrica, "Em andamento (Seu)")
+        self._stat_card(stats, finalizadas_metrica, "Finalizadas (Base)")
 
         self.linha_divisoria(frame)
 
@@ -896,17 +982,33 @@ class PhoenixTool:
 
         filtro = (self._dashboard_filter or "todos").strip().lower()
         if filtro == "on going":
-            lista = [item for item in historico if str(item.get("status", "")).upper() == "ON GOING"]
+            lista = pendentes_usuario
         elif filtro == "finalizadas":
-            lista = [item for item in historico if str(item.get("status", "")).upper() not in ("ON GOING", "")]
+            lista = finalizadas_todas
         else:
-            lista = list(historico)
+            lista = pendentes_usuario + finalizadas_todas
+
+        # Filtro de busca na base histórica (Ticket, PN, MPN, Description, Solicitante, Requisitante)
+        query = getattr(self, "_dashboard_search_query", "").strip().lower()
+        if query:
+            lista = [
+                item for item in lista
+                if query in str(item.get("ticket", "")).lower()
+                or query in str(item.get("pn", "")).lower()
+                or query in str(item.get("part_number", "")).lower()
+                or query in str(item.get("mpn", "")).lower()
+                or query in str(item.get("description", "")).lower()
+                or query in str(item.get("solicitante", "")).lower()
+                or query in str(item.get("requisitante", "")).lower()
+                or query in str(item.get("produto", "")).lower()
+            ]
 
         if not lista:
-            tk.Label(container, text="Nenhum registro encontrado para este filtro.", bg=BG, fg=TEXTO_MUTED, font=FONT_SUBTITULO).pack(anchor="w", pady=10)
+            msg = "Nenhum registro encontrado para a busca informada." if query else "Nenhum registro encontrado para este filtro."
+            tk.Label(container, text=msg, bg=BG, fg=TEXTO_MUTED, font=FONT_SUBTITULO).pack(anchor="w", pady=10)
             return
 
-        recentes = list(reversed(lista))[:8]
+        recentes = list(reversed(lista))[:12]
         for item in recentes:
             self._linha_historico(container, item)
 
@@ -920,6 +1022,8 @@ class PhoenixTool:
                 str(item.get("produto", "")),
                 str(item.get("solicitante", "")),
                 str(item.get("requisitante", "")),
+                str(item.get("pn") or item.get("part_number") or ""),
+                str(item.get("ultima_alteracao", "")),
             )
             for item in historico
         )
@@ -956,38 +1060,109 @@ class PhoenixTool:
         ).pack(pady=(2, 10))
 
     def _linha_historico(self, parent, item):
-        linha = tk.Frame(parent, bg=BG_CARD, cursor="hand2", highlightbackground=BORDA, highlightthickness=0)
-        linha.pack(fill="x", padx=0, pady=6)
+        card = tk.Frame(
+            parent,
+            bg=BG_CARD,
+            cursor="hand2",
+            highlightbackground=BORDA,
+            highlightthickness=1,
+            bd=0,
+        )
+        card.pack(fill="x", padx=0, pady=6)
 
-        topo = tk.Frame(linha, bg=BG_CARD)
-        topo.pack(fill="x")
+        corpo = tk.Frame(card, bg=BG_CARD, padx=14, pady=12)
+        corpo.pack(fill="both", expand=True)
 
-        status = str(item.get("status", "—")).upper()
-        destaque = ACCENT if status == "ON GOING" else TEXTO_MUTED
+        topo = tk.Frame(corpo, bg=BG_CARD)
+        topo.pack(fill="x", pady=(0, 6))
 
-        tk.Label(
-            topo, text=str(item.get("description", "—")).upper(),
-            bg=BG_CARD, fg=TEXTO, font=("Arial", 11, "bold")
-        ).pack(side="left", padx=12, pady=10)
+        btn_area = tk.Frame(topo, bg=BG_CARD)
+        btn_area.pack(side="right", anchor="ne", padx=(10, 0))
 
-        tk.Label(
-            topo, text=espacar(status),
-            bg=BG_CARD, fg=destaque, font=FONT_CAPTION
-        ).pack(side="right", padx=12, pady=10)
+        status_raw = str(item.get("status", "—")).strip().upper()
+        status_on_going = (status_raw == "ON GOING")
+        status_encerrado = (status_raw == "ENCERRADO")
 
-        if status == "ON GOING":
-            tk.Label(
-                topo,
-                text="PENDENTE",
+        if status_on_going:
+            badge_bg = "#3a2d14"
+            badge_fg = "#ffbf69"
+            badge_texto = "PENDENTE"
+        elif status_encerrado:
+            badge_bg = "#2a1010"
+            badge_fg = "#ff6b6b"
+            badge_texto = "ENCERRADO"
+        else:
+            badge_bg = "#163321"
+            badge_fg = "#67d28d"
+            badge_texto = status_raw or "FINALIZADO"
+
+        badge = tk.Label(
+            btn_area,
+            text=badge_texto,
+            bg=badge_bg,
+            fg=badge_fg,
+            font=("Arial", 8, "bold"),
+            padx=8,
+            pady=4,
+        )
+        badge.pack(side="right", padx=(6, 0))
+
+        if status_encerrado:
+            btn_editar = tk.Button(
+                btn_area,
+                text="🔒 Encerrado",
                 bg=BG_CARD,
-                fg="#ffbf69",
+                fg="#555555",
+                relief="solid",
+                bd=1,
+                font=("Arial", 8),
+                padx=8,
+                pady=3,
+                state="disabled",
+            )
+        else:
+            btn_editar = tk.Button(
+                btn_area,
+                text="Editar",
+                command=lambda item=item: self._abrir_editar_registro(item),
+                bg=BG_CARD,
+                fg=ACCENT,
+                activebackground=BORDA,
+                activeforeground=TEXTO,
+                relief="solid",
+                bd=1,
                 font=("Arial", 8, "bold"),
-            ).pack(side="right", padx=(0, 8), pady=10)
+                padx=8,
+                pady=3,
+                cursor="hand2",
+            )
+        btn_editar.pack(side="right", padx=(6, 0))
 
-        btn_editar = tk.Button(
-            topo,
-            text="Editar",
-            command=lambda item=item: self._abrir_editar_registro(item),
+
+        btn_excluir = tk.Button(
+            btn_area,
+            text="Excluir",
+            command=lambda item=item: self._excluir_registro(item),
+            bg=BG_CARD,
+            fg="#ff6b6b",
+            activebackground=BORDA,
+            activeforeground=TEXTO,
+            relief="solid",
+            bd=1,
+            font=("Arial", 8, "bold"),
+            padx=8,
+            pady=3,
+            cursor="hand2",
+        )
+
+        btn_excluir.pack(side="right", padx=(6, 0))
+
+
+
+
+        btn_atualizar_pn = tk.Button(
+            btn_area,
+            text="Atualizar PN Phoenix",
             bg=BG_CARD,
             fg=ACCENT,
             activebackground=BORDA,
@@ -995,53 +1170,236 @@ class PhoenixTool:
             relief="solid",
             bd=1,
             font=("Arial", 8, "bold"),
-            padx=10,
-            pady=4,
+            padx=8,
+            pady=3,
             cursor="hand2",
         )
-        btn_editar.pack(side="right", padx=(0, 8), pady=10)
+        btn_atualizar_pn.pack(side="right", padx=(6, 0))
+        btn_atualizar_pn.configure(command=lambda item=item, botao=btn_atualizar_pn: self._atualizar_pn_dashboard(item, botao))
 
+        # Título do produto com a descrição limpa (sem tabs soltos)
+        raw_desc = str(item.get("description", "—")).strip()
+        desc_limpa = " • ".join(part.strip() for part in raw_desc.replace("\t", " • ").split(" • ") if part.strip()) or "Sem descrição"
+        produto_val = str(item.get("produto") or "").strip()
+
+        if produto_val and produto_val.lower() != "não informado":
+            titulo_texto = f"{produto_val.upper()} — {desc_limpa}"
+        else:
+            titulo_texto = desc_limpa
+
+        lbl_titulo = tk.Label(
+            topo,
+            text=titulo_texto,
+            bg=BG_CARD,
+            fg=TEXTO,
+            font=("Arial", 10, "bold"),
+            justify="left",
+            anchor="w",
+            wraplength=480,
+        )
+        lbl_titulo.pack(side="left", fill="x", expand=True)
+
+        # Linha divisória interna suave
+        div = tk.Frame(corpo, bg=BORDA, height=1)
+        div.pack(fill="x", pady=(4, 10))
+
+        # Seção de informações em baixo
+        info_frame = tk.Frame(corpo, bg=BG_CARD)
+        info_frame.pack(fill="x")
+
+        data_abert = item.get("data_abertura", "—")
+        hora_abert = item.get("hora_abertura", "")
+
+        data_str = f"{data_abert} {hora_abert}".strip() if hora_abert else str(data_abert)
+
+        line1_text = f"Data: {data_str}"
         tk.Label(
-            linha,
-            text=f"Linha {item.get('linha', '—')}   ·   {item.get('data_abertura', '—')}"
-                 f"   ·   {item.get('user', '—')}",
-            bg=BG_CARD, fg=TEXTO_MUTED, font=("Arial", 9)
-        ).pack(anchor="w", padx=12, pady=(0, 2))
+            info_frame,
+            text=line1_text,
+            bg=BG_CARD,
+            fg=TEXTO_MUTED,
+            font=("Arial", 9),
+        ).pack(anchor="w", pady=(0, 2))
 
         solicitante = str(item.get("solicitante") or "").strip() or "Não informado"
         requisitante = str(item.get("requisitante") or "").strip() or "Não informado"
-        produto = str(item.get("produto") or "").strip() or "Não informado"
         tk.Label(
-            linha,
-            text=f"Produto: {produto}",
-            bg=BG_CARD, fg=TEXTO_MUTED, font=("Arial", 9)
-        ).pack(anchor="w", padx=12, pady=(0, 2))
-        tk.Label(
-            linha,
+            info_frame,
             text=f"Solicitante: {solicitante}   ·   Requisitante: {requisitante}",
-            bg=BG_CARD, fg=TEXTO_MUTED, font=("Arial", 9)
-        ).pack(anchor="w", padx=12, pady=(0, 10))
+            bg=BG_CARD,
+            fg=TEXTO_MUTED,
+            font=("Arial", 9),
+        ).pack(anchor="w", pady=(0, 2))
 
-        tk.Frame(linha, bg=BORDA, height=1).pack(fill="x", padx=12)
+        produto = str(item.get("produto") or "").strip() or "Não informado"
+        ticket = str(item.get("ticket") or "").strip()
+        mpn_val = str(item.get("mpn") or "").strip()
+        origem_val = str(item.get("origem") or "").strip()
+        custo_val = str(item.get("custo") or "").strip()
+        custo_fin = bool(item.get("custo_finalizado"))
+
+        line3_text = f"Produto: {produto}"
+        if mpn_val:
+            line3_text += f"   ·   MPN: {mpn_val}"
+        if ticket:
+            line3_text += f"   ·   Ticket: {ticket}"
+        tk.Label(
+            info_frame,
+            text=line3_text,
+            bg=BG_CARD,
+            fg=TEXTO_MUTED,
+            font=("Arial", 9),
+        ).pack(anchor="w", pady=(0, 2))
+
+        line4_parts = []
+        if origem_val:
+            line4_parts.append(f"Origem: {origem_val}")
+        if custo_val:
+            custo_label = f"Custo: {custo_val}"
+            if custo_fin:
+                custo_label += " ✓"
+            line4_parts.append(custo_label)
+        if line4_parts:
+            tk.Label(
+                info_frame,
+                text="   ·   ".join(line4_parts),
+                bg=BG_CARD,
+                fg=TEXTO_MUTED,
+                font=("Arial", 9),
+            ).pack(anchor="w", pady=(0, 2))
+
+        # PN Capturado (Part Number)
+        pn_val = str(item.get("pn") or item.get("part_number") or "").strip()
+        pn_row = tk.Frame(info_frame, bg=BG_CARD)
+        pn_row.pack(anchor="w", pady=(2, 2))
+
+        tk.Label(
+            pn_row,
+            text="PN Capturado: ",
+            bg=BG_CARD,
+            fg=TEXTO_MUTED,
+            font=("Arial", 9, "bold"),
+        ).pack(side="left")
+
+        if pn_val:
+            tk.Label(
+                pn_row,
+                text=pn_val,
+                bg=BG_CARD,
+                fg=ACCENT,
+                font=("Arial", 9, "bold"),
+            ).pack(side="left")
+        else:
+            tk.Label(
+                pn_row,
+                text="Não capturado",
+                bg=BG_CARD,
+                fg=TEXTO_MUTED,
+                font=("Arial", 9, "italic"),
+            ).pack(side="left")
+
+        # Auditoria (Criado por & Última Alteração)
+        criador = str(item.get("criado_por") or item.get("user") or "—").strip()
+        criado_em = str(item.get("criado_em") or data_str).strip()
+        ultima_alt = str(item.get("ultima_alteracao") or criado_em).strip()
+        usr_alt = str(item.get("ultimo_usuario_alterou") or criador).strip()
+
+        audit_text = f"Criado por: {criador} ({criado_em})   ·   Última alteração: {ultima_alt} por {usr_alt}"
+        tk.Label(
+            info_frame,
+            text=audit_text,
+            bg=BG_CARD,
+            fg="#8c8c8c",
+            font=("Arial", 8),
+        ).pack(anchor="w", pady=(2, 0))
 
         def mostrar_detalhes(e=None):
+            hist_log = "\n".join(
+                f"  • {h.get('data')} - {h.get('descricao')} ({h.get('usuario')})"
+                for h in item.get("historico_alteracoes", [])
+            ) or "  • Nenhum histórico registrado."
+
+            origem_d = item.get("origem") or "Não informado"
+            custo_d = item.get("custo") or "Não informado"
+            custo_fin_d = "Sim" if item.get("custo_finalizado") else "Não"
+
             messagebox.showinfo(
-                "Detalhes",
-                f"ID: {item.get('id', '—')}\n\n"
-                f"Description: {item.get('description', '—')}\n\n"
-                f"Status: {item.get('status', '—')}\n\n"
-                f"Data abertura: {item.get('data_abertura', '—')}\n\n"
-                f"PN: {item.get('pn') or '—'}\n\n"
-                f"Produto: {item.get('produto') or 'Não informado'}\n\n"
-                f"Solicitante: {item.get('solicitante') or 'Não informado'}\n\n"
+                "Detalhes do Registro",
+                f"ID: {item.get('id', '—')}\n"
+                f"Linha: {item.get('linha', '—')}\n"
+                f"Ticket: {item.get('ticket') or '—'}\n\n"
+                f"Description: {item.get('description', '—')}\n"
+                f"Produto: {item.get('produto') or 'Não informado'}\n"
+                f"MPN: {item.get('mpn') or 'Não informado'}\n\n"
+                f"Status: {item.get('status', '—')}\n"
+                f"PN Capturado: {pn_val or '—'}\n"
+                f"Origem: {origem_d}\n"
+                f"Custo: {custo_d}   |   Custo Finalizado: {custo_fin_d}\n\n"
+                f"Solicitante: {item.get('solicitante') or 'Não informado'}\n"
                 f"Requisitante: {item.get('requisitante') or 'Não informado'}\n\n"
-                f"Usuário: {item.get('user', '—')}"
+                f"--- AUDITORIA ---\n"
+                f"Criado por: {criador} em {criado_em}\n"
+                f"Última alteração: {ultima_alt} por {usr_alt}\n\n"
+                f"--- HISTÓRICO DE ALTERAÇÕES ---\n"
+                f"{hist_log}"
             )
 
-        for widget in (linha, topo):
+        def on_enter(e=None):
+            card.configure(highlightbackground=ACCENT)
+
+        def on_leave(e=None):
+            card.configure(highlightbackground=BORDA)
+
+        card.bind("<Enter>", on_enter)
+        card.bind("<Leave>", on_leave)
+
+        for widget in (corpo, topo, info_frame, lbl_titulo):
             widget.bind("<Button-1>", mostrar_detalhes)
 
+    def _atualizar_pn_dashboard(self, item, botao=None):
+        ticket = str(item.get("ticket") or "").strip()
+        if not ticket:
+            messagebox.showwarning("Atualizar PN Phoenix", "Este registro não possui ticket.")
+            return
+
+        if botao is not None and botao.winfo_exists():
+            botao.configure(state="disabled", text="Buscando...")
+
+        def _worker():
+            resultado = buscar_pn_por_ticket(ticket)
+            self.root.after(0, lambda: self._finalizar_atualizacao_pn(resultado, botao))
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _finalizar_atualizacao_pn(self, resultado, botao=None):
+        if botao is not None:
+            try:
+                if botao.winfo_exists():
+                    botao.configure(state="normal", text="Atualizar PN Phoenix")
+            except Exception:
+                pass
+
+        if not resultado.get("ok"):
+            messagebox.showinfo("Atualizar PN Phoenix", resultado.get("mensagem") or "PART NUMBER AINDA NÃO FOI GERADO")
+            return
+
+        messagebox.showinfo("Atualizar PN Phoenix", resultado.get("mensagem") or "Part Number atualizado.")
+
+        if FRAME_DASHBOARD in self.frames:
+            historico = self._carregar_historico()
+            self._dashboard_last_signature = self._dashboard_signature(historico)
+            self._renderizar_dashboard_conteudo(self.frames[FRAME_DASHBOARD], historico)
+
     def _abrir_editar_registro(self, item):
+        # Bloquear edição de registros encerrados
+        if str(item.get("status", "")).upper() == "ENCERRADO":
+            messagebox.showwarning(
+                "Registro Encerrado",
+                "Este registro está encerrado e não pode ser editado.\n\n"
+                "Registros encerrados possuem PN, Origem e Custo preenchidos e finalizados."
+            )
+            return
+
         janela = tk.Toplevel(self.root)
         janela.title("Editar informações do produto")
         janela.configure(bg=BG)
@@ -1079,26 +1437,98 @@ class PhoenixTool:
         campo_requisitante.grid(row=3, column=1, sticky="ew", pady=(0, 6), padx=(10, 0), ipady=4)
         campo_requisitante.insert(0, str(item.get("requisitante") or ""))
 
+        tk.Label(
+            corpo, text=espacar("PN (Part Number)"), bg=BG, fg=TEXTO_MUTED, font=FONT_CAPTION
+        ).grid(row=4, column=0, sticky="w", pady=(0, 6))
+        campo_pn = self.campo_entry(corpo)
+        campo_pn.grid(row=4, column=1, sticky="ew", pady=(0, 6), padx=(10, 0), ipady=4)
+        campo_pn.insert(0, str(item.get("pn") or item.get("part_number") or ""))
+
+        tk.Label(
+            corpo, text=espacar("MPN"), bg=BG, fg=TEXTO_MUTED, font=FONT_CAPTION
+        ).grid(row=5, column=0, sticky="w", pady=(0, 6))
+        campo_mpn = self.campo_entry(corpo)
+        campo_mpn.grid(row=5, column=1, sticky="ew", pady=(0, 6), padx=(10, 0), ipady=4)
+        campo_mpn.insert(0, str(item.get("mpn") or ""))
+
+        tk.Label(
+            corpo, text=espacar("Origem"), bg=BG, fg=TEXTO_MUTED, font=FONT_CAPTION
+        ).grid(row=6, column=0, sticky="w", pady=(0, 6))
+        campo_origem = self.campo_entry(corpo)
+        campo_origem.grid(row=6, column=1, sticky="ew", pady=(0, 6), padx=(10, 0), ipady=4)
+        campo_origem.insert(0, str(item.get("origem") or "IMPORTADO"))
+
+        tk.Label(
+            corpo, text=espacar("Custo"), bg=BG, fg=TEXTO_MUTED, font=FONT_CAPTION
+        ).grid(row=7, column=0, sticky="w", pady=(0, 6))
+        campo_custo = self.campo_entry(corpo)
+        campo_custo.grid(row=7, column=1, sticky="ew", pady=(0, 6), padx=(10, 0), ipady=4)
+        campo_custo.insert(0, str(item.get("custo") or ""))
+
+        var_custo_fin = tk.BooleanVar(value=bool(item.get("custo_finalizado")))
+        tk.Label(
+            corpo, text=espacar("Custo Finalizado"), bg=BG, fg=TEXTO_MUTED, font=FONT_CAPTION
+        ).grid(row=8, column=0, sticky="w", pady=(0, 6))
+        chk_custo = tk.Checkbutton(
+            corpo,
+            variable=var_custo_fin,
+            bg=BG,
+            fg=TEXTO,
+            activebackground=BG,
+            selectcolor=BG_CARD,
+            relief="flat",
+        )
+        chk_custo.grid(row=8, column=1, sticky="w", pady=(0, 6), padx=(10, 0))
+
         corpo.grid_columnconfigure(1, weight=1)
 
+        aviso_encerramento = tk.Label(
+            corpo,
+            text="⚠️ Ao preencher PN + Origem + Custo, o registro será encerrado automaticamente.",
+            bg=BG, fg="#ffbf69", font=("Arial", 8, "italic"),
+            wraplength=340, justify="left",
+        )
+        aviso_encerramento.grid(row=9, column=0, columnspan=2, sticky="w", pady=(4, 0))
+
         botoes = tk.Frame(corpo, bg=BG)
-        botoes.grid(row=4, column=0, columnspan=2, pady=(16, 0))
+        botoes.grid(row=10, column=0, columnspan=2, pady=(16, 0))
 
         def salvar():
             novo_produto = campo_produto.get().strip()
             novo_solicitante = campo_solicitante.get().strip()
             novo_requisitante = campo_requisitante.get().strip()
+            novo_pn = campo_pn.get().strip()
+            novo_mpn = campo_mpn.get().strip()
+            nova_origem = campo_origem.get().strip()
+            novo_custo = campo_custo.get().strip()
+            novo_custo_fin = var_custo_fin.get()
+
             atualizar_campos_registro(
                 item.get("linha"),
                 {
                     "produto": novo_produto,
                     "solicitante": novo_solicitante,
                     "requisitante": novo_requisitante,
+                    "pn": novo_pn,
+                    "part_number": novo_pn,
+                    "mpn": novo_mpn,
+                    "origem": nova_origem,
+                    "custo": novo_custo,
+                    "custo_finalizado": novo_custo_fin,
                 },
+                usuario_alteracao=self.usuario,
             )
-            item["produto"] = novo_produto
-            item["solicitante"] = novo_solicitante
-            item["requisitante"] = novo_requisitante
+            item.update({
+                "produto": novo_produto,
+                "solicitante": novo_solicitante,
+                "requisitante": novo_requisitante,
+                "pn": novo_pn,
+                "part_number": novo_pn,
+                "mpn": novo_mpn,
+                "origem": nova_origem,
+                "custo": novo_custo,
+                "custo_finalizado": novo_custo_fin,
+            })
             janela.destroy()
             if FRAME_DASHBOARD in self.frames:
                 historico = self._carregar_historico()
@@ -1137,6 +1567,7 @@ class PhoenixTool:
                 ("Home Phoenix", lambda: executar_script("automocoes", "phoenix", "phoenix.py", arg="home"), "Retorna ao fluxo inicial"),
                 ("Nova solicitação", lambda: executar_script("automocoes", "phoenix", "phoenix.py"), "Inicia uma nova solicitação"),
                 ("Atualizar PN Phoenix", self._abrir_atualizar_pn_phoenix, "Busca e atualiza o PN"),
+                ("Importar solicitações existentes", lambda: executar_script("automocoes", "phoenix", "phoenix.py", arg="importar"), "Traz tickets já criados que não estão no dashboard"),
             ],
         )
 
@@ -1372,3 +1803,4 @@ if __name__ == "__main__":
     root = tk.Tk()
     app = PhoenixTool(root)
     root.mainloop()
+
