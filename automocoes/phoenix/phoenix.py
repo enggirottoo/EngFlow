@@ -495,14 +495,7 @@ def _fluxo_nova_solicitacao(
             registro["linha"], registro.get("ticket"), seq, total_produtos
         )
 
-        try:
-            enviar_para_planilha(desc_item, linha=registro.get("linha"), usuario=user_final)
-            logger.info("Payload enviado para a planilha (linha %s).", registro.get("linha"))
-        except Exception:
-            logger.exception(
-                "Falha ao enviar payload para a planilha (o registro %s no histórico já foi salvo).",
-                registro.get("linha")
-            )
+        
 
 
 # =====================================================
@@ -667,3 +660,141 @@ def _capturar_dados_minhas_solicitacoes(page: Page, descricao: str) -> Optional[
     )
 
     return dados
+
+
+
+def abrir_home_phoenix() -> None:
+    config = carregar_config()
+
+    with sync_playwright() as p:
+        browser, context, page = _abrir_phoenix(p, config)
+
+        logger.info("Home Phoenix aberta.")
+        input("Pressione ENTER para fechar...")
+
+        browser.close()
+
+
+# =====================================================
+# FUNÇÃO 2: fluxo completo de solicitação P0032 (botão "Nova Solicitação")
+# =====================================================
+
+def nova_solicitacao_phoenix() -> None:
+    config = carregar_config()
+
+    with sync_playwright() as p:
+        browser, context, page = _abrir_phoenix(p, config)
+
+        # P0032
+        logger.info("Abrindo P0032...")
+        page.fill("#TaskName", "32")
+        page.click("text=P0032")
+        page.click('xpath=//*[@id="formId"]/div/div[2]/button')
+        page.wait_for_load_state("domcontentloaded")
+        logger.info("P0032 OK")
+
+        # ESCOLHER TEMPLATE
+        logger.info("Abrindo janela para selecionar o template (.xlsx)...")
+        root = tk.Tk()
+        root.withdraw()
+        # Sem isso a janela de seleção de arquivo pode abrir atrás do
+        # navegador (que acabou de receber foco) e parecer que "não carrega".
+        root.attributes("-topmost", True)
+        root.update()
+
+        arquivo = filedialog.askopenfilename(
+            parent=root,
+            title="Selecione o Template",
+            filetypes=[("Excel", "*.xlsx")]
+        )
+
+        root.destroy()
+
+        if not arquivo:
+            logger.info("Nenhum arquivo selecionado.")
+            browser.close()
+            return
+
+        logger.info("Arquivo selecionado: %s", arquivo)
+
+        # UPLOAD TEMPLATE
+        page.set_input_files("#ExcelFile", arquivo)
+        logger.info("Template carregado")
+
+        # LUPA
+        page.click('xpath=//*[@id="uploadForm"]/div/div[1]/div/div/div/button')
+        logger.info("Lupa clicada")
+
+        try:
+            descricao = page.locator('[id$="__Description"]').input_value()
+            logger.info("DESCRIPTION: %s", descricao)
+        except Exception as exc:
+            logger.error("Erro ao capturar Description: %s", exc)
+            descricao = ""
+
+        # AREA (só existe para alguns usuários)
+        try:
+            if page.locator("#areaId").count() > 0:
+                page.select_option("#areaId", label="ENGENHARIA DE TESTE (JAGUARIÚNA)")
+                logger.info("Area OK - Engenharia de Teste")
+                page.wait_for_timeout(1500)
+        except Exception as exc:
+            logger.error("Erro Area: %s", exc)
+
+        # PRIORITY
+        try:
+            page.wait_for_selector("#Priority", timeout=15000)
+            page.select_option("#Priority", value="URGENT")
+            logger.info("Priority OK")
+        except Exception as exc:
+            logger.error("Erro Priority: %s", exc)
+
+        # COMPANY
+        try:
+            page.select_option("#CompanyId", value="65bb402c-cb05-441f-9a4f-df9eb51c7ae5")
+            logger.info("Company OK")
+        except Exception as exc:
+            logger.error("Erro Company: %s", exc)
+
+        # ITEM TYPE
+        try:
+            page.locator('select[id$="__ItemType"]').select_option(value="D")
+            logger.info("Item Type OK")
+        except Exception as exc:
+            logger.error("Erro Item Type: %s", exc)
+
+        # ROHS
+        try:
+            page.locator('select[id$="__Rohs"]').select_option(value="na")
+            logger.info("ROHS OK")
+        except Exception as exc:
+            logger.error("Erro ROHS: %s", exc)
+
+        # ORIGIN
+        try:
+            page.locator('select[id$="__Origin"]').select_option(value="IMPORTADO")
+            logger.info("Origin OK")
+        except Exception as exc:
+            logger.error("Erro Origin: %s", exc)
+
+        logger.info("=" * 50)
+        logger.info("PREENCHER MANUALMENTE: Assunto Principal, Manufacturer")
+        logger.info("=" * 50)
+        logger.info("Confirme a solicitação no Phoenix e pressione ENTER para registrar no histórico.")
+
+        input("Pressione ENTER para registrar e finalizar...")
+
+        registro = criar_registro_descricao(descricao or "", config.get("user", ""))
+        logger.info("Histórico salvo. Linha criada: %s", registro["linha"])
+
+        enviar_para_planilha(descricao or "", linha=registro.get("linha"), usuario=config.get("user", ""))
+        logger.info("Payload enviado para a planilha.")
+
+        browser.close()
+
+
+if __name__ == "__main__":
+    if len(sys.argv) > 1 and sys.argv[1] == "home":
+        abrir_home_phoenix()
+    else:
+        nova_solicitacao_phoenix()
