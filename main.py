@@ -8,6 +8,12 @@ from urllib.request import Request, urlopen
 
 from core.runner import abrir_planilha, executar_script, logger
 from automocoes.phoenix.atualizar_pn import buscar_pn_por_ticket
+from services.database import (
+    iniciar_pegasus,
+    finalizar_pegasus,
+    iniciar_custo,
+    finalizar_custo,
+)
 from services.storage import (
     atualizar_campos_registro,
     carregar_config,
@@ -18,8 +24,9 @@ from services.storage import (
     salvar_estado_app,
     salvar_login,
     cancelar_registro,
-
 )
+
+
 from ui import theme
 from ui.theme import (
     ACCENT,
@@ -43,6 +50,7 @@ from ui.theme import (
 from services.database import inicializar_banco
 
 inicializar_banco()
+
 
 
 FRAME_LOGIN = "frame_login"
@@ -88,6 +96,23 @@ def resumo_ultimo_registro(historico: List[Dict[str, Any]]) -> str:
 
 class PhoenixTool:
 
+    def _iniciar_pegasus(self, item):
+        iniciar_pegasus(item["linha"])
+        self._build_dashboard()
+
+    def _finalizar_pegasus(self, item):
+        finalizar_pegasus(item["linha"])
+        self._build_dashboard()
+
+    def _iniciar_custo(self, item):
+        iniciar_custo(item["linha"])
+        self._build_dashboard()
+
+    def _finalizar_custo(self, item):
+        finalizar_custo(item["linha"])
+        self._build_dashboard()
+
+
     def _excluir_registro(self, item):
         confirmar = messagebox.askyesno(
             "Excluir Registro",
@@ -126,7 +151,10 @@ class PhoenixTool:
 
     def __init__(self, root):
         self.root = root
-        self.root.title("Phoenix Tool")
+        self.root.overrideredirect(True)
+        self._drag_x = 0
+        self._drag_y = 0
+        self.root.title("Tax Classification")
         self.root.resizable(True, True)
         self.root.minsize(560, 720)
         self.root.state("zoomed")
@@ -171,6 +199,8 @@ class PhoenixTool:
         FOOTER_BG = theme.FOOTER_BG
 
     def _montar_estrutura_chrome(self):
+
+
         self._aplicar_estilo()
 
         self.header = tk.Frame(self.root, bg=HEADER_BG, height=52, highlightbackground=BORDA, highlightthickness=0)
@@ -203,31 +233,85 @@ class PhoenixTool:
         tk.Label(nav_right, text="  •  ", bg=FOOTER_BG, fg=TEXTO_MUTED, font=("Arial", 8)).pack(side="right")
         tk.Label(nav_right, text="MINIMAL", bg=FOOTER_BG, fg=TEXTO_MUTED, font=("Arial", 8)).pack(side="right")
 
-        self.signature = tk.Label(
+        
+        self.signature_frame = tk.Frame(
             self.root,
-            text="Desenvolvido por Gabriell Girotto",
+            bg=BG
+        )
+
+        self.signature_frame.pack(
+            side="bottom",
+            pady=5
+
+        )
+
+        self.signature_text = tk.Label(
+           self.signature_frame,
+            text="Developed by ",
             bg=BG,
             fg="#6f6f6f",
-            font=("Arial", 8),
+            font=("Arial", 8) 
         )
-        self.signature.place(relx=0.5, rely=0.985, anchor="s")
+        self.signature_text.pack(side="left")
 
+        self.signature_name = tk.Label(
+            self.signature_frame,
+            text="Gabriel Girotto",
+            bg=BG,
+            fg="white",
+            font=("Arial", 8, "bold")
+        )
+
+        self.signature_name.pack(side="left")
+
+    
         area_rolagem = tk.Frame(self.root, bg=BG)
         area_rolagem.pack(fill="both", expand=True)
 
-        self.main_canvas = tk.Canvas(area_rolagem, bg=BG, highlightthickness=0, bd=0)
-        self.vscrollbar = tk.Scrollbar(area_rolagem, orient="vertical", command=self.main_canvas.yview)
-        self.hscrollbar = tk.Scrollbar(area_rolagem, orient="horizontal", command=self.main_canvas.xview)
-        self.main_canvas.configure(yscrollcommand=self.vscrollbar.set, xscrollcommand=self.hscrollbar.set)
+        self.main_canvas = tk.Canvas(
+            area_rolagem,
+            bg=BG,
+            highlightthickness=0,
+            bd=0)
 
-        self.vscrollbar.pack(side="right", fill="y")
-        self.hscrollbar.pack(side="bottom", fill="x")
-        self.main_canvas.pack(side="left", fill="both", expand=True)
+        self.vscrollbar = tk.Scrollbar(
+            area_rolagem,
+            orient="vertical",
+            command=self.main_canvas.yview
+        )
 
-        self.container = tk.Frame(self.main_canvas, bg=BG)
-        self.container.grid_columnconfigure(0, weight=1)
-        self._container_window = self.main_canvas.create_window((0, 0), window=self.container, anchor="nw")
+        self.main_canvas.configure(
+            yscrollcommand=self.vscrollbar.set
+        )
 
+        #self.vscrollbar.pack(
+            #side="right",
+            #fill="y"
+        #)
+
+        self.main_canvas.pack(
+            side="left",
+            fill="both",
+            expand=True
+
+        )
+
+        self.container = tk.Frame(
+            self.main_canvas,
+            bg=BG
+        )
+
+        self.container.grid_columnconfigure(
+            0,
+            weight=1
+        )
+
+        self._container_window = self.main_canvas.create_window(
+            (0,0),
+            window=self.container,
+            anchor="nw"
+        )
+        
         def _atualizar_scrollregion(event=None):
             self.main_canvas.configure(scrollregion=self.main_canvas.bbox("all"))
 
@@ -1144,7 +1228,7 @@ class PhoenixTool:
             text="Excluir",
             command=lambda item=item: self._excluir_registro(item),
             bg=BG_CARD,
-            fg="#ff6b6b",
+            fg="#281F1F",
             activebackground=BORDA,
             activeforeground=TEXTO,
             relief="solid",
@@ -1157,7 +1241,79 @@ class PhoenixTool:
 
         btn_excluir.pack(side="right", padx=(6, 0))
 
+        btn_pegasus = tk.Button(
+            btn_area,
+            text="Iniciar Pegasus",
+            command=lambda item=item: self._iniciar_pegasus(item),
+            bg=BG_CARD,
+            fg=ACCENT,
+            activebackground=BORDA,
+            activeforeground=TEXTO,
+            relief="solid",
+            bd=1,
+            font=("Arial", 8, "bold"),
+            padx=6,
+            pady=2,
+            
+        )
 
+        btn_pegasus.pack(side="left", padx=2)
+
+
+        
+        btn_pegasus_fim = tk.Button(
+            btn_area,
+            text="Finalizar Pegasus",
+            command=lambda item=item: self._finalizar_pegasus(item),
+            bg=BG_CARD,
+            fg=ACCENT,
+            activebackground=BORDA,
+            activeforeground=TEXTO,
+            relief="solid",
+            bd=1,
+            font=("Arial", 8, "bold"),
+            padx=6,
+            pady=2,
+            
+        )
+
+        btn_pegasus_fim.pack(side="left", padx=2)
+
+        btn_custo = tk.Button(
+            btn_area,
+            text="Iniciar Custo",
+            command=lambda item=item: self._iniciar_custo(item),
+            bg=BG_CARD,
+            fg=ACCENT,
+            activebackground=BORDA,
+            activeforeground=TEXTO,
+            relief="solid",
+            bd=1,
+            font=("Arial", 8, "bold"),
+            padx=6,
+            pady=2,
+        )
+
+        btn_custo.pack(side="left", padx=2)
+
+
+        btn_custo_fim = tk.Button(
+            btn_area,
+            text="Finalizar Custo",
+            command=lambda item=item: self._finalizar_custo(item),
+            bg=BG_CARD,
+            fg=ACCENT,
+            activebackground=BORDA,
+            activeforeground=TEXTO,
+            relief="solid",
+            bd=1,
+            font=("Arial", 8, "bold"),
+            padx=6,
+            pady=2,
+
+            )
+
+        btn_custo_fim.pack(side="left", padx=2)
 
 
         btn_atualizar_pn = tk.Button(
@@ -1803,4 +1959,3 @@ if __name__ == "__main__":
     root = tk.Tk()
     app = PhoenixTool(root)
     root.mainloop()
-
