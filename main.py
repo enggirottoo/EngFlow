@@ -408,7 +408,7 @@ class PhoenixTool:
     def _atualizar_nav(self, nome):
         mapa = {
             FRAME_LOGIN: None,
-            FRAME_MENU: "dashboard",
+            FRAME_MENU: "dashboar",
             FRAME_DASHBOARD: "dashboard",
             FRAME_MENU_PHOENIX: "phoenix",
             FRAME_ATUALIZAR_PN: "phoenix",
