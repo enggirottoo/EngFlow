@@ -91,7 +91,7 @@ def resumo_ultimo_registro(historico: List[Dict[str, Any]]) -> str:
     status = str(item.get("status", "")).strip().upper()
 
     if status == "ON GOING":
-        status_texto = "Em andamento"
+        status_texto = "Em andamentos"
     elif status:
         status_texto = "Finalizado"
     else:
