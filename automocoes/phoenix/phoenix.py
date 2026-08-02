@@ -232,7 +232,7 @@ def _abrir_phoenix(
             pass
         if abriu_phoenix and page.url == url_antes_click:
             logger.warning(
-                "Cliquei no link do Phoenix, mas a URL não mudou (%s). O clique "
+                "Cliquei no link do Phoenix, maa URL não mudou (%s). O clique "
                 "provavelmente não teve efeito - verifique se o seletor ainda é o correto.",
                 page.url,
             )
