@@ -14,15 +14,7 @@ Chamado pelo main.py assim (mesmo padrão de subprocess já usado no projeto):
     python atualizar_pn.py <linha>
 
 IMPORTANTE - SELETORES
------------------------
-Os trechos marcados com "# AJUSTAR SELETOR" são palpites baseados no padrão
-que já existe em `phoenix.py` (ids tipo #FlexUser, localizadores por texto,
-etc). Use o Playwright Inspector para confirmar:
-
-    PWDEBUG=1 python atualizar_pn.py 281
-
-ou insira `page.pause()` em qualquer ponto do fluxo para inspecionar o HTML
-ao vivo e ajustar o seletor certo.
+--.
 """
 
 from __future__ import annotations
