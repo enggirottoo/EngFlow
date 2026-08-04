@@ -1,8 +1,4 @@
-# =====================================================================
-# DISPATCHER DE AUTOMAÇÕES (deve ficar ANTES de todos os imports pesados)
-# Quando o EXE é chamado com ``--automacao <nome>``, executa a automação
-# diretamente e encerra — sem carregar GUI, matplotlib, openpyxl etc.
-# =====================================================================
+
 import sys
 import os
 
@@ -189,6 +185,10 @@ from services.database import (
     obter_e_limpar_codigos_importados,
     obter_estatisticas_banco,
     obter_e_limpar_primeiro_admin_gerado,
+    listar_notificacoes,
+    contar_notificacoes_nao_lidas,
+    marcar_notificacao_lida,
+    marcar_todas_notificacoes_lidas,
 )
 from services.backup import fazer_backup, listar_backups, verificar_e_criar_backup_diario
 from services.storage import (
@@ -429,6 +429,22 @@ class PhoenixTool:
         self.user_badge.pack(side="left", padx=(12, 0))
         tk.Label(self.header, text="STATUS: ONLINE", bg=HEADER_BG, fg=TEXTO_MUTED, font=("Arial", 9)).pack(side="right", padx=20)
 
+        self.notif_btn = tk.Button(
+            self.header,
+            text="🔔",
+            bg=HEADER_BG,
+            fg=TEXTO_MUTED,
+            activebackground=HEADER_BG,
+            activeforeground=ACCENT,
+            font=("Arial", 12),
+            bd=0,
+            highlightthickness=0,
+            cursor="hand2",
+            command=self._abrir_notificacoes,
+        )
+        self.notif_btn.pack(side="right", padx=(0, 4))
+        self._notif_after_id = None
+
         self.footer = tk.Frame(self.root, bg=FOOTER_BG, height=32, bd=0, highlightthickness=0)
         self.footer.pack(fill="x", side="bottom")
         self.footer.pack_propagate(False)
@@ -530,6 +546,115 @@ class PhoenixTool:
 
         self.main_canvas.bind("<Enter>", _bind_scroll)
         self.main_canvas.bind("<Leave>", _unbind_scroll)
+
+    # =========================================================================
+    # Notificações
+    # =========================================================================
+
+    def _atualizar_badge_notificacoes(self):
+        """Atualiza o texto do sino com a quantidade de notificações não lidas."""
+        if not hasattr(self, "notif_btn") or not self.notif_btn.winfo_exists():
+            return
+
+        qtde = contar_notificacoes_nao_lidas(self.usuario) if self.usuario else 0
+
+        if qtde > 0:
+            texto = f"🔔 ({qtde if qtde < 100 else '99+'})"
+            self.notif_btn.config(text=texto, fg="#ff5555")
+        else:
+            self.notif_btn.config(text="🔔", fg=TEXTO_MUTED)
+
+        self._notif_after_id = self.root.after(30000, self._atualizar_badge_notificacoes)
+
+    def _abrir_notificacoes(self):
+        """Abre um painel com as notificações do usuário logado."""
+        if not self.usuario:
+            return
+
+        notificacoes = listar_notificacoes(self.usuario)
+
+        janela = tk.Toplevel(self.root)
+        janela.title("Notificações")
+        janela.configure(bg=BG)
+        janela.geometry("460x420")
+        janela.transient(self.root)
+
+        cabecalho = tk.Frame(janela, bg=BG)
+        cabecalho.pack(fill="x", padx=12, pady=(12, 6))
+        tk.Label(cabecalho, text="Notificações", bg=BG, fg=TEXTO, font=FONT_SUBTITULO).pack(side="left")
+
+        def _marcar_todas():
+            marcar_todas_notificacoes_lidas(self.usuario)
+            self._atualizar_badge_notificacoes_imediato()
+            janela.destroy()
+            self._abrir_notificacoes()
+
+        tk.Button(
+            cabecalho, text="Marcar todas como lidas", bg=BG_CARD, fg=TEXTO, bd=0,
+            font=FONT_CAPTION, cursor="hand2", command=_marcar_todas,
+        ).pack(side="right")
+
+        area = tk.Frame(janela, bg=BG)
+        area.pack(fill="both", expand=True, padx=12, pady=6)
+
+        canvas = tk.Canvas(area, bg=BG, highlightthickness=0, bd=0)
+        scrollbar = tk.Scrollbar(area, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=scrollbar.set)
+        canvas.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+
+        lista = tk.Frame(canvas, bg=BG)
+        canvas.create_window((0, 0), window=lista, anchor="nw")
+
+        def _atualizar_scrollregion(event=None):
+            canvas.configure(scrollregion=canvas.bbox("all"))
+        lista.bind("<Configure>", _atualizar_scrollregion)
+
+        if not notificacoes:
+            tk.Label(lista, text="Nenhuma notificação por aqui.", bg=BG, fg=TEXTO_MUTED, font=FONT_CAPTION).pack(pady=20)
+        else:
+            for notif in notificacoes:
+                self._montar_item_notificacao(lista, notif, janela)
+
+    def _montar_item_notificacao(self, parent, notif, janela_pai):
+        lida = bool(notif.get("lida"))
+        card = tk.Frame(parent, bg=BG_CARD if not lida else BG, bd=1, relief="solid", highlightbackground=BORDA)
+        card.pack(fill="x", pady=4)
+
+        ticket = notif.get("ticket") or ""
+        produto = notif.get("produto") or ""
+        cabecalho_txt = f"{produto}" + (f"  •  Ticket {ticket}" if ticket else "")
+        tk.Label(card, text=cabecalho_txt, bg=card["bg"], fg=TEXTO, font=("Arial", 9, "bold"), anchor="w", justify="left").pack(fill="x", padx=10, pady=(8, 0))
+
+        autor = notif.get("usuario_origem") or "?"
+        quando = notif.get("data_hora") or ""
+        tk.Label(
+            card, text=f"{notif.get('descricao', '')}", bg=card["bg"], fg=TEXTO, font=("Arial", 8), anchor="w", justify="left", wraplength=380
+        ).pack(fill="x", padx=10, pady=(2, 0))
+        tk.Label(
+            card, text=f"Alterado por {autor} em {quando}", bg=card["bg"], fg=TEXTO_MUTED, font=("Arial", 7), anchor="w"
+        ).pack(fill="x", padx=10, pady=(2, 8))
+
+        if not lida:
+            def _marcar(nid=notif.get("id")):
+                marcar_notificacao_lida(nid)
+                self._atualizar_badge_notificacoes_imediato()
+                janela_pai.destroy()
+                self._abrir_notificacoes()
+
+            tk.Button(
+                card, text="Marcar como lida", bg=BG_CARD, fg=ACCENT, bd=0,
+                font=("Arial", 7, "underline"), cursor="hand2", command=_marcar,
+            ).pack(anchor="e", padx=10, pady=(0, 6))
+
+    def _atualizar_badge_notificacoes_imediato(self):
+        """Atualiza o badge sem esperar o próximo ciclo do polling."""
+        if hasattr(self, "notif_btn") and self.notif_btn.winfo_exists():
+            qtde = contar_notificacoes_nao_lidas(self.usuario) if self.usuario else 0
+            if qtde > 0:
+                self.notif_btn.config(text=f"🔔 ({qtde if qtde < 100 else '99+'})", fg="#ff5555")
+            else:
+                self.notif_btn.config(text="🔔", fg=TEXTO_MUTED)
 
     def _alternar_tema(self):
         novo_tema = TEMA_CLARO if tema_atual() == TEMA_ESCURO else TEMA_ESCURO
@@ -1081,6 +1206,7 @@ class PhoenixTool:
         self._build_menu()
         self.history = []
         self.mostrar(FRAME_MENU)
+        self._atualizar_badge_notificacoes()
 
     # =========================================================================
     # MENU PRINCIPAL (Específico por Perfil)
@@ -1343,7 +1469,7 @@ class PhoenixTool:
         cred = self._obter_ou_pedir_credencial("COST")
         if not cred:
             return
-        executar_script("automocoes", "cost", "cost.py", cred_user=cred["login"], cred_pass=cred["senha"])
+        executar_script("automocoes", "cost", "cost.py", cred_user=cred["login"], cred_pass=cred["senha"], tool_user=self.usuario)
 
     def _carregar_historico(self):
         return carregar_historico()
@@ -2148,7 +2274,7 @@ class PhoenixTool:
         cred = self._obter_ou_pedir_credencial("PHOENIX")
         if not cred:
             return
-        executar_script("automocoes", "phoenix", "phoenix.py", arg=arg, cred_user=cred["login"], cred_pass=cred["senha"])
+        executar_script("automocoes", "phoenix", "phoenix.py", arg=arg, cred_user=cred["login"], cred_pass=cred["senha"], tool_user=self.usuario)
 
     def _build_menu_phoenix(self):
         if FRAME_MENU_PHOENIX in self.frames:
@@ -2180,7 +2306,7 @@ class PhoenixTool:
         cred = self._obter_ou_pedir_credencial("PEGASUS")
         if not cred:
             return
-        executar_script("automocoes", "pegasus", "pegasus.py", arg=arg, cred_user=cred["login"], cred_pass=cred["senha"])
+        executar_script("automocoes", "pegasus", "pegasus.py", arg=arg, cred_user=cred["login"], cred_pass=cred["senha"], tool_user=self.usuario)
 
     def _build_menu_pegasus(self):
         if FRAME_MENU_PEGASUS in self.frames:
@@ -2252,7 +2378,7 @@ class PhoenixTool:
             cred = self._obter_ou_pedir_credencial("PHOENIX")
             if not cred:
                 return
-            executar_script("automocoes", "phoenix", "atualizar_pn.py", arg=linha, cred_user=cred["login"], cred_pass=cred["senha"])
+            executar_script("automocoes", "phoenix", "atualizar_pn.py", arg=linha, cred_user=cred["login"], cred_pass=cred["senha"], tool_user=self.usuario)
             messagebox.showinfo("Phoenix", "Automação iniciada em segundo plano.")
 
         self.botao_flat(bloco, "Buscar Registro", buscar).pack(fill="x", pady=(14, 6))
@@ -2461,7 +2587,7 @@ class PhoenixTool:
             btn_del = tk.Button(
                 col_right, text="Excluir",
                 command=lambda uid=u_id, unome=u["nome"]: self._excluir_usuario_confirm(uid, unome),
-                bg=BG_CARD, fg="#ff4d4d", relief="flat", bd=0, font=("Arial", 9, "bold"), padx=8, pady=4, cursor="hand2"
+                bg=BG_CARD, fg="#ff0505ff", relief="flat", bd=0, font=("Arial", 9, "bold"), padx=8, pady=4, cursor="hand2"
             )
             btn_del.pack(side="left", padx=4)
 
@@ -2711,7 +2837,7 @@ if __name__ == "__main__":
     root = tk.Tk()
     root.report_callback_exception = lambda et, ev, tb: _tratar_excecao_global(et, ev, tb)
 
-    # Executar backup de inicialização do sistema
+   
     try:
         fazer_backup("startup_main")
     except Exception as _b_err:
