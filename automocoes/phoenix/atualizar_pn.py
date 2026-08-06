@@ -1,21 +1,4 @@
-"""Automação: Atualizar PN Phoenix
-================================
 
-Implementa as Partes 3 a 7 do fluxo:
-
-  3) Login automático no Phoenix + navegação até "Solicitações Finalizadas"
-  4) Localizar a solicitação certa (Ticket > Description + Data)
-  5) Entrar em STEPS STATUS e capturar o PN no step "Criação de Part Number"
-  6) Capturar a Data de Fechamento
-  7) Atualizar o registro no historico_solicitacoes.json
-
-Chamado pelo main.py assim (mesmo padrão de subprocess já usado no projeto):
-
-    python atualizar_pn.py <linha>
-
-IMPORTANTE - SELETORES
---.
-"""
 
 from __future__ import annotations
 
