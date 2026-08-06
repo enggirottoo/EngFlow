@@ -1,16 +1,4 @@
-"""Automação Phoenix (Portal + Phoenix).
 
-Duas entradas são usadas pelo Phoenix Tool (via `subprocess`, veja
-`services/process_runner.py`):
-
-    python phoenix.py home   -> abrir_home_phoenix()
-    python phoenix.py        -> nova_solicitacao_phoenix()
-
-O fluxo de login (`_preencher_login`) e a lógica de detectar se o clique em
-um link/tile abriu uma nova aba (`_abrir_phoenix`) são compartilhados com
-`pegasus.py`; qualquer ajuste de seletor de login deve ser espelhado lá
-também caso o Portal mude.
-"""
 
 from __future__ import annotations
 
