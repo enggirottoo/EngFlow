@@ -59,8 +59,8 @@ def _dispatch_automacao() -> bool:
         elif a == "--cred-pass" and i + 1 < len(args):
             cred_pass = cred_pass or args[i + 1]
 
-    # No Windows, se o EXE é windowed (console=False), criar console visível
-    if os.name == "nt":
+    # No Windows, se o EXE é windowed (console=False), criar console visível (a menos que seja automação invisível)
+    if os.name == "nt" and "--invisible" not in sys.argv:
         try:
             import ctypes
             kernel32 = ctypes.windll.kernel32
@@ -93,9 +93,11 @@ def _dispatch_automacao() -> bool:
     # Despachar para a automação correta
     try:
         if nome == "phoenix":
-            from automocoes.phoenix.phoenix import abrir_home_phoenix, nova_solicitacao_phoenix
+            from automocoes.phoenix.phoenix import abrir_home_phoenix, nova_solicitacao_phoenix, sincronizar_solicitacoes_phoenix
             if arg_valor == "home":
                 abrir_home_phoenix()
+            elif arg_valor in ("capturar", "importar"):
+                sincronizar_solicitacoes_phoenix()
             else:
                 nova_solicitacao_phoenix()
 
@@ -189,8 +191,11 @@ from services.database import (
     contar_notificacoes_nao_lidas,
     marcar_notificacao_lida,
     marcar_todas_notificacoes_lidas,
+    verificar_e_gerar_alertas_inatividade,
+    registrar_tentativa_bloqueada,
 )
 from services.backup import fazer_backup, listar_backups, verificar_e_criar_backup_diario
+from services.importador_planilha import importar_excel_historico
 from services.storage import (
     atualizar_campos_registro,
     carregar_config,
@@ -429,6 +434,21 @@ class PhoenixTool:
         self.user_badge.pack(side="left", padx=(12, 0))
         tk.Label(self.header, text="STATUS: ONLINE", bg=HEADER_BG, fg=TEXTO_MUTED, font=("Arial", 9)).pack(side="right", padx=20)
 
+        help_btn = tk.Button(
+            self.header,
+            text="❓",
+            bg=HEADER_BG,
+            fg=TEXTO_MUTED,
+            activebackground=HEADER_BG,
+            activeforeground=ACCENT,
+            font=("Arial", 12),
+            bd=0,
+            highlightthickness=0,
+            cursor="hand2",
+            command=self._abrir_ajuda,
+        )
+        help_btn.pack(side="right", padx=(0, 2))
+
         self.notif_btn = tk.Button(
             self.header,
             text="🔔",
@@ -531,7 +551,7 @@ class PhoenixTool:
         self.main_canvas.bind("<Configure>", _ajustar_largura_container)
 
         def _scroll_vertical(event):
-            self.main_canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+            self.main_canvas.yview_scroll(int(-2 * (event.delta / 120)), "units")
 
         def _scroll_horizontal(event):
             self.main_canvas.xview_scroll(int(-1 * (event.delta / 120)), "units")
@@ -552,9 +572,14 @@ class PhoenixTool:
     # =========================================================================
 
     def _atualizar_badge_notificacoes(self):
-        """Atualiza o texto do sino com a quantidade de notificações não lidas."""
+        """Atualiza o texto do sino com a quantidade de notificações não lidas e verifica inatividade."""
         if not hasattr(self, "notif_btn") or not self.notif_btn.winfo_exists():
             return
+
+        try:
+            verificar_e_gerar_alertas_inatividade()
+        except Exception as exc:
+            logger.warning("Erro no monitoramento de inatividade de produtos: %s", exc)
 
         qtde = contar_notificacoes_nao_lidas(self.usuario) if self.usuario else 0
 
@@ -570,6 +595,11 @@ class PhoenixTool:
         """Abre um painel com as notificações do usuário logado."""
         if not self.usuario:
             return
+
+        try:
+            verificar_e_gerar_alertas_inatividade()
+        except Exception:
+            pass
 
         notificacoes = listar_notificacoes(self.usuario)
 
@@ -618,25 +648,69 @@ class PhoenixTool:
 
     def _montar_item_notificacao(self, parent, notif, janela_pai):
         lida = bool(notif.get("lida"))
-        card = tk.Frame(parent, bg=BG_CARD if not lida else BG, bd=1, relief="solid", highlightbackground=BORDA)
+        desc = str(notif.get("descricao") or "")
+
+        # Níveis de criticidade visual
+        borda_cor = BORDA
+        if "🔴" in desc or "Vermelho" in desc:
+            borda_cor = "#e74c3c"
+        elif "🟠" in desc or "Laranja" in desc:
+            borda_cor = "#e67e22"
+        elif "🟡" in desc or "Amarelo" in desc:
+            borda_cor = "#f1c40f"
+
+        card = tk.Frame(parent, bg=BG_CARD if not lida else BG, bd=1, relief="solid", highlightbackground=borda_cor)
         card.pack(fill="x", pady=4)
 
         ticket = notif.get("ticket") or ""
         produto = notif.get("produto") or ""
-        cabecalho_txt = f"{produto}" + (f"  •  Ticket {ticket}" if ticket else "")
-        tk.Label(card, text=cabecalho_txt, bg=card["bg"], fg=TEXTO, font=("Arial", 9, "bold"), anchor="w", justify="left").pack(fill="x", padx=10, pady=(8, 0))
+        cabecalho_txt = f"{produto}" + (f"  •  Ticket #{ticket}" if ticket else "")
+        lbl_hdr = tk.Label(card, text=cabecalho_txt, bg=card["bg"], fg=TEXTO, font=("Arial", 9, "bold"), anchor="w", justify="left")
+        lbl_hdr.pack(fill="x", padx=10, pady=(8, 0))
 
         autor = notif.get("usuario_origem") or "?"
         quando = notif.get("data_hora") or ""
-        tk.Label(
-            card, text=f"{notif.get('descricao', '')}", bg=card["bg"], fg=TEXTO, font=("Arial", 8), anchor="w", justify="left", wraplength=380
-        ).pack(fill="x", padx=10, pady=(2, 0))
-        tk.Label(
-            card, text=f"Alterado por {autor} em {quando}", bg=card["bg"], fg=TEXTO_MUTED, font=("Arial", 7), anchor="w"
-        ).pack(fill="x", padx=10, pady=(2, 8))
+        lbl_desc = tk.Label(
+            card, text=desc, bg=card["bg"], fg=TEXTO, font=("Arial", 8), anchor="w", justify="left", wraplength=380
+        )
+        lbl_desc.pack(fill="x", padx=10, pady=(2, 0))
+
+        lbl_sub = tk.Label(
+            card, text=f"Origem: {autor} em {quando}", bg=card["bg"], fg=TEXTO_MUTED, font=("Arial", 7), anchor="w"
+        )
+        lbl_sub.pack(fill="x", padx=10, pady=(2, 8))
+
+        def _ir_para_ticket(e=None, t=ticket, nid=notif.get("id")):
+            if nid and not lida:
+                marcar_notificacao_lida(nid)
+                self._atualizar_badge_notificacoes_imediato()
+            try:
+                janela_pai.destroy()
+            except Exception:
+                pass
+
+            if hasattr(self, "notebook") and self.notebook:
+                try:
+                    self.notebook.select(0)
+                except Exception:
+                    pass
+
+            if t and hasattr(self, "campo_busca") and self.campo_busca.winfo_exists():
+                try:
+                    self.campo_busca.delete(0, "end")
+                    self.campo_busca.insert(0, t)
+                    self._dashboard_search_query = t.strip().lower()
+                    if hasattr(self, "_carregar_dashboard"):
+                        self._carregar_dashboard()
+                except Exception as exc:
+                    logger.warning("Erro ao filtrar ticket no Dashboard: %s", exc)
+
+        for w in (card, lbl_hdr, lbl_desc, lbl_sub):
+            w.config(cursor="hand2")
+            w.bind("<Button-1>", _ir_para_ticket)
 
         if not lida:
-            def _marcar(nid=notif.get("id")):
+            def _marcar(e=None, nid=notif.get("id")):
                 marcar_notificacao_lida(nid)
                 self._atualizar_badge_notificacoes_imediato()
                 janela_pai.destroy()
@@ -821,6 +895,8 @@ class PhoenixTool:
         style.map("TEntry", fieldbackground=[("focus", "#1c2230")], foreground=[("focus", TEXTO)])
 
     def mostrar(self, nome, empilhar=True):
+        if nome != FRAME_DASHBOARD:
+            self._cancelar_timer_dashboard()
         for f in self.frames.values():
             f.pack_forget()
         if empilhar and (not self.history or self.history[-1] != nome):
@@ -848,25 +924,9 @@ class PhoenixTool:
 
     def _animar_fade(self, alvo=0.98, passos=6, intervalo=18):
         try:
-            atual = float(self.root.attributes("-alpha"))
-        except Exception:
-            atual = 0.98
-
-        if atual >= alvo:
             self.root.attributes("-alpha", alvo)
-            return
-
-        passo = (alvo - atual) / passos
-
-        def _aplicar(idx):
-            if idx >= passos:
-                self.root.attributes("-alpha", alvo)
-                return
-            nova = atual + passo * (idx + 1)
-            self.root.attributes("-alpha", nova)
-            self.root.after(intervalo, lambda i=idx + 1: _aplicar(i))
-
-        _aplicar(0)
+        except Exception:
+            pass
 
     def _show_loading_state(self):
         self._loading_frame = tk.Frame(self.container, bg=BG)
@@ -893,11 +953,11 @@ class PhoenixTool:
         loading_fill = getattr(self, "_loading_fill", None)
         if loading_fill is None or not loading_fill.winfo_exists():
             return
-        self._loading_progress = (self._loading_progress + 1) % 101
+        self._loading_progress = (self._loading_progress + 2) % 101
         largura = 20 + (self._loading_progress % 80)
         loading_fill.configure(width=largura)
         if getattr(self, "_loading_frame", None) is not None and self._loading_frame.winfo_exists():
-            self.root.after(25, self._animar_loading)
+            self.root.after(50, self._animar_loading)
 
     def _finalizar_inicializacao(self):
         if getattr(self, "_loading_frame", None) is not None:
@@ -1027,14 +1087,83 @@ class PhoenixTool:
 
     def build_menu_automacao(self, parent, titulo, itens):
         self.botao_voltar(parent)
-        self.cabecalho(parent, "Automação", titulo)
+
+        center_box = tk.Frame(parent, bg=BG)
+        center_box.pack(anchor="n", expand=True, pady=16, padx=28)
+
+        # Cabeçalho Minimalista
+        painel = tk.Frame(center_box, bg=BG_CARD, highlightbackground=BORDA, highlightthickness=1)
+        painel.pack(fill="x", pady=(0, 16))
+
+        inner_p = tk.Frame(painel, bg=BG_CARD, padx=20, pady=16)
+        inner_p.pack(fill="x")
+
+        tk.Label(
+            inner_p, text="AUTOMAÇÃO", bg=BG_CARD, fg=ACCENT, font=("Arial", 9, "bold")
+        ).pack(anchor="w", pady=(0, 2))
+
+        tk.Label(
+            inner_p, text=titulo.upper(), bg=BG_CARD, fg=TEXTO, font=("Arial", 18, "bold")
+        ).pack(anchor="w")
+
+        # Opções limpas em formato card
         for index, item in enumerate(itens, start=1):
             if isinstance(item, tuple) and len(item) == 3:
                 label, comando, descricao = item
             else:
                 label, comando = item
                 descricao = None
-            self.card_navegavel(parent, index, label, comando, descricao)
+
+            card = tk.Frame(
+                center_box, bg=BG_CARD, cursor="hand2",
+                highlightbackground=BORDA, highlightthickness=1
+            )
+            card.pack(fill="x", pady=5)
+
+            def _on_enter(e, t=card):
+                t.configure(highlightbackground=ACCENT)
+
+            def _on_leave(e, t=card):
+                t.configure(highlightbackground=BORDA)
+
+            card.bind("<Enter>", _on_enter)
+            card.bind("<Leave>", _on_leave)
+
+            inner = tk.Frame(card, bg=BG_CARD, padx=16, pady=12)
+            inner.pack(fill="both", expand=True)
+
+            lbl_num = tk.Label(
+                inner, text=f".{index:02d}", bg=BG_CARD, fg=ACCENT,
+                font=("Arial", 11, "bold")
+            )
+            lbl_num.pack(side="left", padx=(0, 12))
+
+            text_area = tk.Frame(inner, bg=BG_CARD)
+            text_area.pack(side="left", fill="both", expand=True)
+
+            lbl_title = tk.Label(
+                text_area, text=label.upper(), bg=BG_CARD, fg=TEXTO,
+                font=("Arial", 10, "bold"), anchor="w"
+            )
+            lbl_title.pack(fill="x")
+
+            lbl_desc = None
+            if descricao:
+                lbl_desc = tk.Label(
+                    text_area, text=descricao, bg=BG_CARD, fg=TEXTO_MUTED,
+                    font=("Arial", 8), anchor="w"
+                )
+                lbl_desc.pack(fill="x", pady=(1, 0))
+
+            cmd = comando
+            for w in [card, inner, text_area, lbl_num, lbl_title]:
+                w.bind("<Button-1>", lambda e, c=cmd: c())
+                w.bind("<Enter>", _on_enter)
+                w.bind("<Leave>", _on_leave)
+            if lbl_desc:
+                lbl_desc.bind("<Button-1>", lambda e, c=cmd: c())
+                lbl_desc.bind("<Enter>", _on_enter)
+                lbl_desc.bind("<Leave>", _on_leave)
 
     # =========================================================================
     # LOGIN (Refatorado: Nome Completo + Código Engenharia, sem Senha)
@@ -1167,6 +1296,116 @@ class PhoenixTool:
         janela.geometry(f"+{x}+{y}")
         janela.grab_set()
 
+    def _dialog_trocar_pin_primeiro_acesso(self, nome: str, user_id: int) -> bool:
+        """Exibe um diálogo modal obrigatório para o usuário cadastrar seu próprio PIN pessoal no 1º login."""
+        resultado = [False]
+
+        janela = tk.Toplevel(self.root)
+        janela.title("🔐 Definição Obrigatória de PIN Personalizado")
+        janela.configure(bg=BG)
+        janela.attributes("-topmost", True)
+        janela.resizable(False, False)
+        janela.transient(self.root)
+
+        janela.update_idletasks()
+        w, h = 480, 430
+        x = (janela.winfo_screenwidth() // 2) - (w // 2)
+        y = (janela.winfo_screenheight() // 2) - (h // 2)
+        janela.geometry(f"{w}x{h}+{x}+{y}")
+
+        hdr = tk.Frame(janela, bg=ACCENT, height=54)
+        hdr.pack(fill="x")
+        hdr.pack_propagate(False)
+
+        tk.Label(
+            hdr, text="🔐  CRIE SEU PIN DE SEGURANÇA",
+            bg=ACCENT, fg="#ffffff", font=("Arial", 12, "bold")
+        ).pack(side="left", padx=16, pady=14)
+
+        corpo = tk.Frame(janela, bg=BG, padx=24, pady=16)
+        corpo.pack(fill="both", expand=True)
+
+        tk.Label(
+            corpo,
+            text=f"Olá, {nome}!\nEsta é a sua primeira vez acessando (ou o Administrador forneceu um código temporário para você).\nPor questões de segurança, você deve definir seu novo PIN pessoal de 4+ dígitos agora.",
+            bg=BG, fg=TEXTO, font=("Arial", 9), justify="left", wraplength=430
+        ).pack(anchor="w", pady=(0, 10))
+
+        alerta_frame = tk.Frame(corpo, bg="#3a2a0a" if tema_atual() == "dark" else "#fff3e0", bd=0, highlightthickness=1, highlightbackground=ACCENT)
+        alerta_frame.pack(fill="x", pady=(0, 14))
+
+        tk.Label(
+            alerta_frame,
+            text="⚠️ ATENÇÃO E AVISO IMPORTANTE:\nGuarde e salve seu novo PIN em local seguro!\nSe você esquecer o seu PIN, não será possível recuperar e você precisará solicitar um novo código ao Administrador.",
+            bg=alerta_frame.cget("bg"), fg=ACCENT, font=("Arial", 8, "bold"), justify="left", wraplength=410
+        ).pack(padx=10, pady=8)
+
+        tk.Label(corpo, text="Novo PIN / Código (mínimo 4 dígitos):", bg=BG, fg=TEXTO_MUTED, font=("Arial", 8, "bold")).pack(anchor="w", pady=(4, 2))
+        entry_pin1 = self.campo_entry(corpo, mostrar="*")
+        entry_pin1.pack(fill="x", ipady=6, pady=(0, 10))
+
+        tk.Label(corpo, text="Confirmar Novo PIN / Código:", bg=BG, fg=TEXTO_MUTED, font=("Arial", 8, "bold")).pack(anchor="w", pady=(0, 2))
+        entry_pin2 = self.campo_entry(corpo, mostrar="*")
+        entry_pin2.pack(fill="x", ipady=6, pady=(0, 14))
+
+        entry_pin1.focus_set()
+
+        def _confirmar_troca():
+            pin1 = entry_pin1.get().strip()
+            pin2 = entry_pin2.get().strip()
+
+            if not pin1 or len(pin1) < 4:
+                messagebox.showwarning("PIN Inválido", "O novo PIN deve conter no mínimo 4 caracteres.", parent=janela)
+                entry_pin1.focus_set()
+                return
+
+            if pin1 != pin2:
+                messagebox.showwarning("Confirmação Incorreta", "A confirmação do PIN não coincide com o novo PIN digitado.", parent=janela)
+                entry_pin2.focus_set()
+                return
+
+            from services.database import alterar_codigo_usuario
+            ok = alterar_codigo_usuario(user_id, pin1)
+            if ok:
+                messagebox.showinfo(
+                    "PIN Salvo com Sucesso",
+                    "✅ Seu novo PIN foi definido e salvo com sucesso!\n\n"
+                    "Lembre-se de guardá-lo em local seguro. Use este novo PIN em seus próximos logins.",
+                    parent=janela
+                )
+                resultado[0] = True
+                janela.destroy()
+            else:
+                messagebox.showerror("Erro", "Não foi possível atualizar seu PIN no banco de dados.", parent=janela)
+
+        def _cancelar():
+            resultado[0] = False
+            janela.destroy()
+
+        btn_box = tk.Frame(corpo, bg=BG)
+        btn_box.pack(fill="x", pady=(6, 0))
+
+        btn_salvar = tk.Button(
+            btn_box, text="SALVAR NOVO PIN", command=_confirmar_troca,
+            bg=ACCENT, fg="#ffffff", activebackground=ACCENT_HOVER, activeforeground="#ffffff",
+            bd=0, relief="flat", font=("Arial", 9, "bold"), cursor="hand2", pady=8
+        )
+        btn_salvar.pack(side="left", fill="x", expand=True, padx=(0, 4))
+
+        btn_canc = tk.Button(
+            btn_box, text="Cancelar", command=_cancelar,
+            bg=BG_CARD, fg=TEXTO, activebackground=BORDA, activeforeground=TEXTO,
+            relief="solid", bd=1, font=("Arial", 9), cursor="hand2", pady=7
+        )
+        btn_canc.pack(side="right", padx=(4, 0))
+
+        entry_pin1.bind("<Return>", lambda e: entry_pin2.focus_set())
+        entry_pin2.bind("<Return>", lambda e: _confirmar_troca())
+
+        janela.grab_set()
+        self.root.wait_window(janela)
+        return resultado[0]
+
     def entrar(self, automatic=False):
         nome = self.campo_nome.get().strip()
         codigo = self.campo_codigo.get().strip()
@@ -1182,6 +1421,12 @@ class PhoenixTool:
 
         if not sucesso or not resultado:
             db_atual = get_db_path()
+            # Segurança: registra a tentativa de login malsucedida para auditoria
+            # (nunca o código/senha digitado, apenas o nome informado).
+            try:
+                registrar_tentativa_bloqueada("LOGIN_FALHOU", f"Nome informado: {nome}", usuario=nome)
+            except Exception:
+                pass
             messagebox.showerror(
                 "Acesso Negado",
                 f"{mensagem_motivo}\n\n"
@@ -1190,7 +1435,15 @@ class PhoenixTool:
             )
             return
 
-        permissao, user_id = resultado
+        permissao = resultado[0]
+        user_id = resultado[1]
+        requer_troca = resultado[2] if len(resultado) > 2 else False
+
+        if requer_troca:
+            trocou_ok = self._dialog_trocar_pin_primeiro_acesso(nome, user_id)
+            if not trocou_ok:
+                return
+
         self.usuario = nome
         self.usuario_id = user_id
         self.permissao = permissao
@@ -1219,76 +1472,111 @@ class PhoenixTool:
         frame = tk.Frame(self.container, bg=BG)
         self.frames[FRAME_MENU] = frame
 
-        # Container centralizado
+        # Container centralizado com largura estipulada (640px)
         center_box = tk.Frame(frame, bg=BG)
-        center_box.pack(anchor="n", expand=True, pady=24)
+        center_box.pack(anchor="n", expand=True, pady=20, padx=28)
 
-        painel = tk.Frame(center_box, bg=BG_CARD, bd=0, highlightthickness=0, width=680)
+        # Header do Painel Principal
+        painel = tk.Frame(center_box, bg=BG_CARD, highlightbackground=BORDA, highlightthickness=1)
         painel.pack(fill="x", pady=(0, 16))
 
-        tk.Label(
-            painel,
-            text="● FLEX-TAX CLASSIFICATION 1.0",
-            bg=BG_CARD,
-            fg=ACCENT,
-            font=("Arial", 8, "bold"),
-        ).pack(anchor="w", padx=20, pady=(16, 0))
+        inner_p = tk.Frame(painel, bg=BG_CARD, padx=24, pady=18)
+        inner_p.pack(fill="x")
+
+        topo_p = tk.Frame(inner_p, bg=BG_CARD)
+        topo_p.pack(fill="x")
 
         tk.Label(
-            painel, text="PAINEL OPERACIONAL", bg=BG_CARD, fg=ACCENT, font=("Arial", 9, "bold")
-        ).pack(anchor="w", padx=20, pady=(12, 4))
+            topo_p, text="FLEX • CLASSIFICAÇÃO FISCAL", bg=BG_CARD, fg=ACCENT, font=("Arial", 8, "bold")
+        ).pack(side="left")
 
         tk.Label(
-            painel, text=f"Bem-vindo, {self.usuario}", bg=BG_CARD, fg=TEXTO, font=("Arial", 16, "bold")
-        ).pack(anchor="w", padx=20, pady=(0, 4))
+            topo_p, text=datetime.now().strftime("%d/%m/%Y  •  %H:%M"), bg=BG_CARD, fg=TEXTO_MUTED, font=("Arial", 8)
+        ).pack(side="right")
 
         tk.Label(
-            painel, text=f"Perfil de acesso: {self.permissao}", bg=BG_CARD, fg=TEXTO_MUTED, font=FONT_SUBTITULO
-        ).pack(anchor="w", padx=20, pady=(0, 16))
+            inner_p, text=f"Bem-vindo, {self.usuario}", bg=BG_CARD, fg=TEXTO, font=("Arial", 16, "bold")
+        ).pack(anchor="w", pady=(6, 2))
 
         tk.Label(
-            center_box,
-            text=datetime.now().strftime("%d/%m/%Y  •  %H:%M"),
-            bg=BG,
-            fg=TEXTO_MUTED,
-            font=("Arial", 9),
-        ).pack(anchor="w", pady=(0, 4))
+            inner_p, text=f"Perfil de acesso: {self.permissao}", bg=BG_CARD, fg=TEXTO_MUTED, font=("Arial", 9)
+        ).pack(anchor="w")
 
         tk.Label(
-            center_box,
-            text=resumo_ultimo_registro(self._carregar_historico()),
-            bg=BG,
-            fg=TEXTO_MUTED,
-            font=("Arial", 9),
-        ).pack(anchor="w", pady=(0, 14))
+            center_box, text="PAINEL DE NAVEGAÇÃO", bg=BG, fg=TEXTO_MUTED, font=("Arial", 8, "bold")
+        ).pack(anchor="w", pady=(6, 10))
 
-        self.cabecalho(center_box, "Navegação", "Menu")
-
-        idx = 1
         perm = str(self.permissao).upper()
 
-        # Todos os perfis veem o Dashboard
-        self.card_navegavel(center_box, idx, "Dashboard", self._abrir_dashboard, "Visão geral operacional e métricas", chave="dashboard")
-        idx += 1
+        menu_opcoes = [
+            ("Dashboard", self._abrir_dashboard, "Visão geral operacional, estatísticas e exportações"),
+            ("Phoenix", self._abrir_menu_phoenix, "Fluxo principal de solicitações P0032 e captura"),
+            ("Pegasus", self._abrir_menu_pegasus, "Fluxo Pegasus e acompanhamento de etapas"),
+            ("Cost Request", self._executar_cost_request, "Automação para solicitação de análise fiscal"),
+            ("Cost by Template", self._abrir_cost_template, "Abre solicitação de Cost Request a partir de um template Excel"),
+            ("Minhas Credenciais", self._abrir_minhas_credenciais, "Gerenciar logins e senhas com PIN seguro"),
+            ("Administração", self._abrir_administracao, "Gerenciar usuários, permissões e backups"),
+        ]
 
-        if perm in ("ADMIN", "ENGENHARIA"):
-            self.card_navegavel(center_box, idx, "Phoenix", self._abrir_menu_phoenix, "Fluxo principal e solicitações", chave="phoenix")
-            idx += 1
-            self.card_navegavel(center_box, idx, "Pegasus", self._abrir_menu_pegasus, "Fluxo Pegasus e classificações", chave="pegasus")
-            idx += 1
-            self.card_navegavel(center_box, idx, "Cost Request", self._executar_cost_request, "Automação de custo")
-            idx += 1
-            self.card_navegavel(center_box, idx, "Minhas Credenciais", self._abrir_minhas_credenciais, "Gerenciar logins de automação", chave="credenciais")
-            idx += 1
+        idx = 1
+        for label, comando, desc in menu_opcoes:
+            # Filtrar por permissão
+            if label in ("Phoenix", "Pegasus", "Cost Request", "Cost by Template", "Minhas Credenciais") and perm not in ("ADMIN", "ENGENHARIA"):
+                continue
+            if label == "Administração" and perm != "ADMIN":
+                continue
 
-        if perm == "ADMIN":
-            self.card_navegavel(center_box, idx, "Administração", self._abrir_administracao, "Gerenciar usuários e permissões do sistema", chave="admin")
+            card = tk.Frame(
+                center_box, bg=BG_CARD, cursor="hand2",
+                highlightbackground=BORDA, highlightthickness=1
+            )
+            card.pack(fill="x", pady=5)
+
+            def _on_enter(e, t=card):
+                t.configure(highlightbackground=ACCENT)
+
+            def _on_leave(e, t=card):
+                t.configure(highlightbackground=BORDA)
+
+            card.bind("<Enter>", _on_enter)
+            card.bind("<Leave>", _on_leave)
+
+            inner = tk.Frame(card, bg=BG_CARD, padx=16, pady=12)
+            inner.pack(fill="both", expand=True)
+
+            lbl_num = tk.Label(
+                inner, text=f".{idx:02d}", bg=BG_CARD, fg=ACCENT,
+                font=("Arial", 11, "bold")
+            )
+            lbl_num.pack(side="left", padx=(0, 12))
+
+            text_area = tk.Frame(inner, bg=BG_CARD)
+            text_area.pack(side="left", fill="both", expand=True)
+
+            lbl_title = tk.Label(
+                text_area, text=label.upper(), bg=BG_CARD, fg=TEXTO,
+                font=("Arial", 10, "bold"), anchor="w"
+            )
+            lbl_title.pack(fill="x")
+
+            lbl_desc = tk.Label(
+                text_area, text=desc, bg=BG_CARD, fg=TEXTO_MUTED,
+                font=("Arial", 8), anchor="w"
+            )
+            lbl_desc.pack(fill="x", pady=(1, 0))
+
+            cmd = comando
+            for w in [card, inner, text_area, lbl_num, lbl_title, lbl_desc]:
+                w.bind("<Button-1>", lambda e, c=cmd: c())
+                w.bind("<Enter>", _on_enter)
+                w.bind("<Leave>", _on_leave)
+
             idx += 1
 
         tk.Label(
-            frame, text=f"Status: Conectado • Perfil: {perm}", bg=BG, fg=ACCENT,
+            frame, text=f"Flex-tax Classification v1.0 • Perfil: {perm}", bg=BG, fg=TEXTO_MUTED,
             font=FONT_CAPTION
-        ).pack(side="bottom", pady=16)
+        ).pack(side="bottom", pady=14)
 
     # =========================================================================
     # GERENCIAMENTO DE CREDENCIAIS INDIVIDUAIS PARA AUTOMAÇÕES
@@ -1471,6 +1759,11 @@ class PhoenixTool:
             return
         executar_script("automocoes", "cost", "cost.py", cred_user=cred["login"], cred_pass=cred["senha"], tool_user=self.usuario)
 
+    def _abrir_cost_template(self):
+        if not self._validar_permissao("cost"):
+            return
+        self._abrir_modal_cost_template()
+
     def _carregar_historico(self):
         return carregar_historico()
 
@@ -1523,38 +1816,13 @@ class PhoenixTool:
         topo_barra = tk.Frame(frame, bg=BG)
         topo_barra.pack(fill="x", padx=28, pady=(0, 10))
 
-        self.botao_flat(topo_barra, "Atualizar", self._abrir_dashboard).pack(side="left")
-
-        # Botões de Exportação para Excel e Ações
-        self.botao_flat(topo_barra, "Exportar Dashboard", self._exportar_dashboard).pack(side="left", padx=(6, 0))
-        self.botao_flat(topo_barra, "Exportar Registros", self._exportar_registros).pack(side="left", padx=(4, 0))
-        self.botao_flat(topo_barra, "Esvaziar Lixeira", self._esvaziar_lixeira_confirm).pack(side="left", padx=(4, 0))
-
-        for texto, valor in (("Todos", "todos"), ("Em andamento", "on going"), ("Finalizadas", "finalizadas"), ("🗑️ Lixeira", "lixeira")):
-            btn = tk.Button(
-                topo_barra,
-                text=texto,
-                command=lambda v=valor: self._aplicar_filtro_dashboard(v),
-                bg=BG_CARD,
-                fg=TEXTO,
-                activebackground=BORDA,
-                activeforeground=TEXTO,
-                relief="solid",
-                bd=1,
-                font=("Arial", 9, "bold"),
-                padx=10,
-                pady=6,
-                cursor="hand2",
-            )
-            btn.pack(side="left", padx=(12, 4) if texto == "Todos" else 4)
-
-        # Barra de Pesquisa
+        # Barra de Pesquisa fixa à DIREITA (nunca foge da tela)
         busca_frame = tk.Frame(topo_barra, bg=BG)
-        busca_frame.pack(side="left", padx=(16, 0))
+        busca_frame.pack(side="right", padx=(10, 0))
 
         tk.Label(
-            busca_frame, text="Buscar:", bg=BG, fg=TEXTO_MUTED, font=("Arial", 9, "bold")
-        ).pack(side="left", padx=(0, 6))
+            busca_frame, text="Buscar:", bg=BG, fg=TEXTO_MUTED, font=("Arial", 8, "bold")
+        ).pack(side="left", padx=(0, 4))
 
         self.campo_busca = tk.Entry(
             busca_frame,
@@ -1562,28 +1830,174 @@ class PhoenixTool:
             fg=TEXTO,
             insertbackground=TEXTO,
             relief="solid",
-            font=("Arial", 9),
+            font=("Arial", 8),
             highlightbackground=BORDA,
             highlightthickness=1,
             bd=0,
-            width=20,
+            width=18,
         )
-        self.campo_busca.pack(side="left", ipady=4)
+        self.campo_busca.pack(side="left", ipady=3)
         if hasattr(self, "_dashboard_search_query") and self._dashboard_search_query:
             self.campo_busca.insert(0, self._dashboard_search_query)
         self.campo_busca.bind("<KeyRelease>", lambda e: self._filtrar_busca_dashboard())
 
+        # Botões de Ação uniformes e elegantes à ESQUERDA
+        btn_base = dict(
+            relief="flat", bd=0, font=("Arial", 8, "bold"),
+            pady=4, cursor="hand2"
+        )
+
+        tk.Button(topo_barra, text="Atualizar", command=self._abrir_dashboard, bg=BG_CARD, fg=TEXTO, activebackground=BORDA, activeforeground=TEXTO, width=12, **btn_base).pack(side="left", padx=2)
+        tk.Button(topo_barra, text="Capturar Phoenix", command=lambda: self._executar_phoenix(arg="capturar"), bg=ACCENT, fg="#ffffff", activebackground=ACCENT_HOVER, activeforeground="#ffffff", width=14, **btn_base).pack(side="left", padx=2)
+        tk.Button(topo_barra, text="Abrir Cost Request", command=self._executar_cost_manual, bg="#e67e22", fg="#ffffff", activebackground="#d35400", activeforeground="#ffffff", width=16, **btn_base).pack(side="left", padx=2)
+        tk.Button(topo_barra, text="Open Request By Template", command=self._abrir_modal_cost_template, bg="#8e44ad", fg="#ffffff", activebackground="#732d91", activeforeground="#ffffff", width=22, **btn_base).pack(side="left", padx=2)
+        tk.Button(topo_barra, text="Importar Planilha", command=self._importar_planilha_excel, bg="#27ae60", fg="#ffffff", activebackground="#219653", activeforeground="#ffffff", width=14, **btn_base).pack(side="left", padx=2)
+        tk.Button(topo_barra, text="Exp. Dashboard", command=self._exportar_dashboard, bg=BG_CARD, fg=TEXTO, activebackground=BORDA, activeforeground=TEXTO, width=13, **btn_base).pack(side="left", padx=2)
+        tk.Button(topo_barra, text="Exp. Registros", command=self._exportar_registros, bg=BG_CARD, fg=TEXTO, activebackground=BORDA, activeforeground=TEXTO, width=13, **btn_base).pack(side="left", padx=2)
+        tk.Button(topo_barra, text="Esvaziar Lixeira", command=self._esvaziar_lixeira_confirm, bg=BG_CARD, fg=TEXTO, activebackground=BORDA, activeforeground=TEXTO, width=13, **btn_base).pack(side="left", padx=2)
+
+        # Separador visual discreto
+        tk.Frame(topo_barra, bg=BORDA, width=1, height=20).pack(side="left", padx=6)
+
+        # Filtros de Status uniformes
+        for texto, valor in (("Todos", "todos"), ("Em andamento", "on going"), ("Finalizadas", "finalizadas"), ("Lixeira", "lixeira")):
+            is_active = getattr(self, "_dashboard_filter", "todos") == valor
+            bg_f = ACCENT if is_active else BG_CARD
+            fg_f = "#ffffff" if is_active else TEXTO
+            btn = tk.Button(
+                topo_barra,
+                text=texto,
+                command=lambda v=valor: self._aplicar_filtro_dashboard(v),
+                bg=bg_f, fg=fg_f, activebackground=ACCENT_HOVER, activeforeground="#ffffff",
+                width=12, **btn_base
+            )
+            btn.pack(side="left", padx=2)
+
+        # Linha de filtro por intervalo de datas
+        data_barra = tk.Frame(frame, bg=BG)
+        data_barra.pack(fill="x", padx=28, pady=(0, 8))
+
+        entry_kw = dict(
+            bg=BG_CARD, fg=TEXTO, insertbackground=TEXTO,
+            relief="solid", font=("Arial", 8),
+            highlightbackground=BORDA, highlightthickness=1, bd=0, width=10
+        )
+
+        tk.Label(data_barra, text="📅 Filtrar por Data:", bg=BG, fg=TEXTO_MUTED, font=("Arial", 8, "bold")).pack(side="left", padx=(0, 6))
+
+        tk.Label(data_barra, text="De:", bg=BG, fg=TEXTO_MUTED, font=("Arial", 8)).pack(side="left", padx=(0, 2))
+        self._date_from = tk.Entry(data_barra, **entry_kw)
+        self._date_from.pack(side="left", ipady=3, padx=(0, 6))
+        if hasattr(self, "_dashboard_date_from") and self._dashboard_date_from:
+            self._date_from.insert(0, self._dashboard_date_from)
+        else:
+            self._date_from.insert(0, "dd/mm/aaaa")
+            self._date_from.configure(fg=TEXTO_MUTED)
+
+        def _focus_in_from(e):
+            if self._date_from.get() == "dd/mm/aaaa":
+                self._date_from.delete(0, "end")
+                self._date_from.configure(fg=TEXTO)
+
+        def _focus_out_from(e):
+            if not self._date_from.get().strip():
+                self._date_from.insert(0, "dd/mm/aaaa")
+                self._date_from.configure(fg=TEXTO_MUTED)
+
+        self._date_from.bind("<FocusIn>", _focus_in_from)
+        self._date_from.bind("<FocusOut>", _focus_out_from)
+
+        tk.Label(data_barra, text="Até:", bg=BG, fg=TEXTO_MUTED, font=("Arial", 8)).pack(side="left", padx=(0, 2))
+        self._date_to = tk.Entry(data_barra, **entry_kw)
+        self._date_to.pack(side="left", ipady=3, padx=(0, 6))
+        if hasattr(self, "_dashboard_date_to") and self._dashboard_date_to:
+            self._date_to.insert(0, self._dashboard_date_to)
+        else:
+            self._date_to.insert(0, "dd/mm/aaaa")
+            self._date_to.configure(fg=TEXTO_MUTED)
+
+        def _focus_in_to(e):
+            if self._date_to.get() == "dd/mm/aaaa":
+                self._date_to.delete(0, "end")
+                self._date_to.configure(fg=TEXTO)
+
+        def _focus_out_to(e):
+            if not self._date_to.get().strip():
+                self._date_to.insert(0, "dd/mm/aaaa")
+                self._date_to.configure(fg=TEXTO_MUTED)
+
+        self._date_to.bind("<FocusIn>", _focus_in_to)
+        self._date_to.bind("<FocusOut>", _focus_out_to)
+
+        def _aplicar_filtro_data():
+            de = self._date_from.get().strip()
+            ate = self._date_to.get().strip()
+            if de == "dd/mm/aaaa":
+                de = ""
+            if ate == "dd/mm/aaaa":
+                ate = ""
+            self._dashboard_date_from = de
+            self._dashboard_date_to = ate
+            if FRAME_DASHBOARD in self.frames:
+                historico_r = self._carregar_historico()
+                self._renderizar_dashboard_conteudo(self.frames[FRAME_DASHBOARD], historico_r)
+
+        def _limpar_filtro_data():
+            self._dashboard_date_from = ""
+            self._dashboard_date_to = ""
+            self._date_from.delete(0, "end")
+            self._date_from.insert(0, "dd/mm/aaaa")
+            self._date_from.configure(fg=TEXTO_MUTED)
+            self._date_to.delete(0, "end")
+            self._date_to.insert(0, "dd/mm/aaaa")
+            self._date_to.configure(fg=TEXTO_MUTED)
+            if FRAME_DASHBOARD in self.frames:
+                historico_r = self._carregar_historico()
+                self._renderizar_dashboard_conteudo(self.frames[FRAME_DASHBOARD], historico_r)
+
+        tk.Button(data_barra, text="Filtrar", command=_aplicar_filtro_data, bg=ACCENT, fg="#ffffff", activebackground=ACCENT_HOVER, activeforeground="#ffffff", relief="flat", bd=0, font=("Arial", 8, "bold"), padx=8, pady=2, cursor="hand2").pack(side="left", padx=2)
+        tk.Button(data_barra, text="Limpar", command=_limpar_filtro_data, bg=BG_CARD, fg=TEXTO, activebackground=BORDA, activeforeground=TEXTO, **btn_base).pack(side="left", padx=2)
+
+        # Indicador de filtro ativo
+        date_from_val = getattr(self, "_dashboard_date_from", "")
+        date_to_val = getattr(self, "_dashboard_date_to", "")
+        if date_from_val or date_to_val:
+            texto_filtro = f"Filtro ativo: {date_from_val or '...'} → {date_to_val or '...'}"
+            tk.Label(data_barra, text=texto_filtro, bg=BG, fg=ACCENT, font=("Arial", 8, "bold")).pack(side="left", padx=(10, 0))
+
         historico = self._carregar_historico()
         self._dashboard_last_signature = self._dashboard_signature(historico)
         self._renderizar_dashboard_conteudo(frame, historico)
-        self.root.after(2000, self._check_dashboard_refresh)
+        self._cancelar_timer_dashboard()
+        self._dashboard_after_id = self.root.after(4000, self._check_dashboard_refresh)
+
+    def _cancelar_timer_dashboard(self):
+        timer_id = getattr(self, "_dashboard_after_id", None)
+        if timer_id:
+            try:
+                self.root.after_cancel(timer_id)
+            except Exception:
+                pass
+            self._dashboard_after_id = None
 
     def _filtrar_busca_dashboard(self):
-        if hasattr(self, "campo_busca"):
-            self._dashboard_search_query = self.campo_busca.get().strip().lower()
-        if FRAME_DASHBOARD in self.frames:
-            historico = self._carregar_historico()
-            self._renderizar_dashboard_conteudo(self.frames[FRAME_DASHBOARD], historico)
+        search_timer = getattr(self, "_search_debounce_id", None)
+        if search_timer:
+            try:
+                self.root.after_cancel(search_timer)
+            except Exception:
+                pass
+            self._search_debounce_id = None
+
+        def _executar_busca():
+            self._search_debounce_id = None
+            if hasattr(self, "campo_busca"):
+                self._dashboard_search_query = self.campo_busca.get().strip().lower()
+            if FRAME_DASHBOARD in self.frames:
+                historico = self._carregar_historico()
+                self._renderizar_dashboard_conteudo(self.frames[FRAME_DASHBOARD], historico)
+
+        self._search_debounce_id = self.root.after(250, _executar_busca)
 
     def _aplicar_filtro_dashboard(self, valor):
         self._dashboard_filter = valor
@@ -1603,6 +2017,70 @@ class PhoenixTool:
             qtd = esvaziar_lixeira()
             messagebox.showinfo("Lixeira Esvaziada", f"{qtd} registro(s) cancelado(s) foi/foram excluído(s) permanentemente do banco.")
             self._abrir_dashboard()
+
+    def _desenhar_grafico_donut_nativo(self, parent, v_fin, v_and, v_can, total_metrica):
+        container = tk.Frame(parent, bg=BG)
+        container._dashboard_area = True
+        container.pack(pady=(10, 15))
+
+        tk.Label(
+            container,
+            text="VISÃO GERAL DAS SOLICITAÇÕES",
+            bg=BG,
+            fg=ACCENT,
+            font=("Arial", 10, "bold")
+        ).pack(pady=(0, 10))
+
+        valores_pie = [v_fin, v_and, v_can]
+        cores_pie = ["#67d28d", "#ffbf69", "#ff6b6b"]
+        labels_pie = ["Finalizadas", "Em andamento", "Canceladas"]
+        total_val = sum(valores_pie)
+
+        cv_dim = 180
+        cv = tk.Canvas(container, width=cv_dim, height=cv_dim, bg=BG, highlightthickness=0, bd=0)
+        cv.pack()
+
+        cx, cy, r_out, r_in = cv_dim // 2, cv_dim // 2, 78, 48
+
+        if total_val == 0:
+            cv.create_oval(
+                cx - r_out, cy - r_out, cx + r_out, cy + r_out,
+                fill="#333b4d", outline=BG, width=2
+            )
+        else:
+            angle_start = 90
+            for val, color in zip(valores_pie, cores_pie):
+                if val <= 0:
+                    continue
+                extent = -360.0 * (val / total_val)
+                if abs(extent) >= 360:
+                    extent = -359.99
+
+                cv.create_arc(
+                    cx - r_out, cy - r_out, cx + r_out, cy + r_out,
+                    start=angle_start, extent=extent, fill=color, outline=BG, width=2, style="pieslice"
+                )
+                angle_start += extent
+
+        # Recorte do miolo (donut hole)
+        cv.create_oval(
+            cx - r_in, cy - r_in, cx + r_in, cy + r_in,
+            fill=BG, outline=BG
+        )
+
+        # Texto central
+        cv.create_text(cx, cy - 8, text=str(total_metrica), fill=TEXTO, font=("Arial", 16, "bold"))
+        cv.create_text(cx, cy + 12, text="TOTAL", fill=TEXTO_MUTED, font=("Arial", 8, "bold"))
+
+        # Legenda infra com indicadores coloridos
+        if total_val > 0:
+            legenda_frame = tk.Frame(container, bg=BG)
+            legenda_frame.pack(pady=(8, 0))
+            for val, color, label in zip(valores_pie, cores_pie, labels_pie):
+                if val > 0:
+                    pct = int(round((val / total_val) * 100))
+                    lbl_txt = f"● {label}: {val} ({pct}%)"
+                    tk.Label(legenda_frame, text=lbl_txt, bg=BG, fg=color, font=("Arial", 8, "bold")).pack(side="left", padx=6)
 
     def _renderizar_dashboard_conteudo(self, frame, historico):
         for widget in frame.winfo_children():
@@ -1624,68 +2102,10 @@ class PhoenixTool:
         self._stat_card(stats, finalizadas_metrica, "Finalizadas")
         self._stat_card(stats, canceladas_metrica, "Canceladas")
 
-        # Gráfico de Pizza
-        grafico_frame = tk.Frame(frame, bg=BG)
-        grafico_frame._dashboard_area = True
-        grafico_frame.pack(pady=(10, 15))
+        # Gráfico Donut Nativo (Super leve, 0ms latency, sem Matplotlib)
+        self._desenhar_grafico_donut_nativo(frame, finalizadas_metrica, em_andamento_metrica, canceladas_metrica, total_metrica)
 
-        tk.Label(
-            grafico_frame,
-            text="VISÃO GERAL DAS SOLICITAÇÕES",
-            bg=BG,
-            fg=ACCENT,
-            font=("Arial", 10, "bold")
-        ).pack(pady=(0, 10))
 
-        v_fin = finalizadas_metrica
-        v_and = em_andamento_metrica
-        v_can = canceladas_metrica
-
-        valores_pie = [v_fin, v_and, v_can]
-        cores_pie = ["#67d28d", "#ffbf69", "#ff6b6b"]
-
-        if sum(valores_pie) == 0:
-            valores_pie = [1, 0, 0]
-
-        import matplotlib.pyplot as plt
-        from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
-
-        fig, ax = plt.subplots(figsize=(3.5, 3.5), facecolor=BG)
-        ax.set_facecolor(BG)
-
-        wedges, texts, autotexts = ax.pie(
-            valores_pie,
-            colors=cores_pie,
-            startangle=90,
-            autopct="%1.0f%%" if sum(valores_pie) > 0 else "",
-            pctdistance=0.75,
-            wedgeprops={"width": 0.40, "edgecolor": BG, "linewidth": 2},
-            textprops={"color": "white", "fontsize": 9, "fontweight": "bold"}
-        )
-
-        ax.text(
-            0, 0,
-            f"{total_metrica}\nTOTAL",
-            color="white", ha="center", va="center",
-            fontsize=14, fontweight="bold"
-        )
-        ax.set_aspect("equal")
-
-        canvas = FigureCanvasTkAgg(fig, master=grafico_frame)
-        canvas.get_tk_widget().configure(bg=BG, highlightthickness=0, bd=0)
-        canvas.draw()
-        canvas.get_tk_widget().pack()
-        plt.close(fig)  # libera memória da figura
-
-        self.linha_divisoria(frame)
-
-        tk.Label(
-            frame,
-            text=espacar("Registros"),
-            bg=BG,
-            fg=TEXTO_MUTED,
-            font=FONT_CAPTION,
-        ).pack(anchor="w", padx=28, pady=(0, 8))
 
         container = tk.Frame(frame, bg=BG)
         container._dashboard_area = True
@@ -1715,14 +2135,70 @@ class PhoenixTool:
                 or query in str(item.get("produto", "")).lower()
             ]
 
+        # Filtro por intervalo de datas (data_abertura no formato dd/mm/yyyy)
+        date_from_str = getattr(self, "_dashboard_date_from", "").strip()
+        date_to_str = getattr(self, "_dashboard_date_to", "").strip()
+        if date_from_str or date_to_str:
+            def _parse_data(txt):
+                """Tenta converter dd/mm/yyyy ou dd/mm/yy em date."""
+                txt = txt.strip()
+                if not txt:
+                    return None
+                for fmt in ("%d/%m/%Y", "%d/%m/%y", "%Y-%m-%d"):
+                    try:
+                        return datetime.strptime(txt, fmt).date()
+                    except ValueError:
+                        continue
+                return None
+
+            dt_from = _parse_data(date_from_str) if date_from_str else None
+            dt_to = _parse_data(date_to_str) if date_to_str else None
+
+            if dt_from or dt_to:
+                filtrada = []
+                for item in lista:
+                    data_ab = str(item.get("data_abertura") or "").strip()
+                    # data_abertura pode ter formato "dd/mm/yyyy HH:MM" — pegar só a parte da data
+                    data_ab_part = data_ab.split(" ")[0] if data_ab else ""
+                    dt_item = _parse_data(data_ab_part)
+                    if dt_item is None:
+                        continue  # Se não tem data válida, não inclui no filtro
+                    if dt_from and dt_item < dt_from:
+                        continue
+                    if dt_to and dt_item > dt_to:
+                        continue
+                    filtrada.append(item)
+                lista = filtrada
         if not lista:
             msg = "Nenhum registro encontrado para a busca informada." if query else "Nenhum registro encontrado para este filtro."
             tk.Label(container, text=msg, bg=BG, fg=TEXTO_MUTED, font=FONT_SUBTITULO).pack(anchor="w", pady=10)
             return
 
-        recentes = list(reversed(lista))[:15]
-        for item in recentes:
+        card_limit = getattr(self, "_dashboard_card_limit", 50)
+        exibir = lista[:card_limit]
+
+        for item in exibir:
             self._linha_historico(container, item)
+
+        if len(lista) > card_limit:
+            pagi_frame = tk.Frame(container, bg=BG)
+            pagi_frame.pack(fill="x", pady=(12, 6))
+
+            info_txt = f"Mostrando {len(exibir)} de {len(lista)} solicitações"
+            tk.Label(pagi_frame, text=info_txt, bg=BG, fg=TEXTO_MUTED, font=("Arial", 9, "bold")).pack(side="left", padx=(4, 12))
+
+            def _carregar_mais():
+                self._dashboard_card_limit = card_limit + 50
+                if FRAME_DASHBOARD in self.frames:
+                    h_rec = self._carregar_historico()
+                    self._renderizar_dashboard_conteudo(self.frames[FRAME_DASHBOARD], h_rec)
+
+            btn_mais = tk.Button(
+                pagi_frame, text="📥 Carregar Mais (+50 Registros)", command=_carregar_mais,
+                bg=ACCENT, fg="#ffffff", activebackground=ACCENT_HOVER, activeforeground="#ffffff",
+                relief="flat", bd=0, font=("Arial", 8, "bold"), padx=12, pady=4, cursor="hand2"
+            )
+            btn_mais.pack(side="left")
 
     def _dashboard_signature(self, historico):
         return tuple(
@@ -1739,8 +2215,10 @@ class PhoenixTool:
 
     def _check_dashboard_refresh(self):
         if self.history and self.history[-1] != FRAME_DASHBOARD:
+            self._cancelar_timer_dashboard()
             return
         if FRAME_DASHBOARD not in self.frames:
+            self._cancelar_timer_dashboard()
             return
 
         db_path = get_db_path()
@@ -1758,58 +2236,93 @@ class PhoenixTool:
                 self._dashboard_last_signature = signature
                 self._renderizar_dashboard_conteudo(self.frames[FRAME_DASHBOARD], historico)
 
-        self.root.after(2000, self._check_dashboard_refresh)
+        self._cancelar_timer_dashboard()
+        self._dashboard_after_id = self.root.after(10000, self._check_dashboard_refresh)
 
     def _stat_card(self, parent, valor, legenda):
-        card = tk.Frame(parent, bg=BG_CARD, highlightbackground=BORDA, highlightthickness=0)
-        card.pack(side="left", expand=True, fill="x", padx=(0, 6))
+        # Cores de destaque por tipo de card
+        cores_legenda = {
+            "total": ("#4fc3f7", "📋"),
+            "em andamento": ("#ffbf69", "⏳"),
+            "finalizadas": ("#67d28d", "✅"),
+            "canceladas": ("#ff6b6b", "🗑️"),
+        }
+        legenda_lower = legenda.strip().lower()
+        cor_accent, icone = cores_legenda.get(legenda_lower, (ACCENT, "📊"))
+
+        card = tk.Frame(parent, bg=BG_CARD, highlightbackground=BORDA, highlightthickness=1)
+        card.pack(side="left", expand=True, fill="x", padx=(0, 8))
+
+        # Barra colorida no topo do card
+        barra = tk.Frame(card, bg=cor_accent, height=4)
+        barra.pack(fill="x")
+
+        conteudo = tk.Frame(card, bg=BG_CARD)
+        conteudo.pack(fill="x", padx=12, pady=(10, 10))
+
+        # Ícone + Número lado a lado
+        topo_card = tk.Frame(conteudo, bg=BG_CARD)
+        topo_card.pack(fill="x")
 
         tk.Label(
-            card, text=str(valor), bg=BG_CARD, fg=TEXTO, font=("Arial", 18, "bold")
-        ).pack(pady=(8, 0))
+            topo_card, text=icone, bg=BG_CARD, fg=cor_accent, font=("Arial", 16)
+        ).pack(side="left", padx=(0, 8))
 
         tk.Label(
-            card, text=espacar(legenda), bg=BG_CARD, fg=TEXTO_MUTED, font=FONT_CAPTION
-        ).pack(pady=(2, 8))
+            topo_card, text=str(valor), bg=BG_CARD, fg=TEXTO, font=("Arial", 22, "bold")
+        ).pack(side="left")
+
+        tk.Label(
+            conteudo, text=legenda.upper(), bg=BG_CARD, fg=TEXTO_MUTED, font=("Arial", 8, "bold"),
+            anchor="w"
+        ).pack(fill="x", pady=(4, 0))
 
     def _linha_historico(self, parent, item):
         perm = str(self.permissao or "").upper()
+
+        status_raw = str(item.get("status", "—")).strip().upper()
+        cancelado = bool(item.get("cancelado")) or status_raw == "CANCELADO"
+        custo_fechado = bool(str(item.get("custo_fechamento") or "").strip())
+        status_on_going = not cancelado and not custo_fechado
+
+        if cancelado:
+            stripe_color = "#ff6b6b"
+            badge_bg = "#3a1414"
+            badge_fg = "#ff6b6b"
+            badge_texto = "CANCELADA"
+        elif status_on_going:
+            stripe_color = "#ffbf69"
+            badge_bg = "#3a2d14"
+            badge_fg = "#ffbf69"
+            badge_texto = "EM ANDAMENTO"
+        else:
+            stripe_color = "#67d28d"
+            badge_bg = "#163321"
+            badge_fg = "#67d28d"
+            badge_texto = "FINALIZADA"
 
         card = tk.Frame(
             parent, bg=BG_CARD, cursor="hand2",
             highlightbackground=BORDA, highlightthickness=1, bd=0
         )
-        card.pack(fill="x", padx=0, pady=6)
+        card.pack(fill="x", padx=0, pady=5)
 
-        corpo = tk.Frame(card, bg=BG_CARD, padx=14, pady=12)
-        corpo.pack(fill="both", expand=True)
+        # Barra lateral colorida de status
+        stripe = tk.Frame(card, bg=stripe_color, width=5)
+        stripe.pack(side="left", fill="y")
+
+        corpo = tk.Frame(card, bg=BG_CARD, padx=14, pady=10)
+        corpo.pack(side="left", fill="both", expand=True)
 
         topo = tk.Frame(corpo, bg=BG_CARD)
-        topo.pack(fill="x", pady=(0, 6))
+        topo.pack(fill="x", pady=(0, 4))
 
         btn_area = tk.Frame(topo, bg=BG_CARD)
         btn_area.pack(side="right", anchor="ne", padx=(10, 0))
 
-        status_raw = str(item.get("status", "—")).strip().upper()
-        cancelado = bool(item.get("cancelado")) or status_raw == "CANCELADO"
-        status_on_going = (status_raw == "ON GOING" and not cancelado)
-
-        if cancelado:
-            badge_bg = "#3a1414"
-            badge_fg = "#ff6b6b"
-            badge_texto = "CANCELADA"
-        elif status_on_going:
-            badge_bg = "#3a2d14"
-            badge_fg = "#ffbf69"
-            badge_texto = "EM ANDAMENTO"
-        else:
-            badge_bg = "#163321"
-            badge_fg = "#67d28d"
-            badge_texto = status_raw or "FINALIZADA"
-
         badge = tk.Label(
             btn_area, text=badge_texto, bg=badge_bg, fg=badge_fg,
-            font=("Arial", 8, "bold"), padx=8, pady=4
+            font=("Arial", 8, "bold"), padx=8, pady=3
         )
         badge.pack(side="right", padx=(6, 0))
 
@@ -1819,27 +2332,29 @@ class PhoenixTool:
                 btn_area, text="Editar",
                 command=lambda item=item: self._abrir_editar_registro(item),
                 bg=BG_CARD, fg=ACCENT, activebackground=BORDA, activeforeground=TEXTO,
-                relief="solid", bd=1, font=("Arial", 8, "bold"), padx=8, pady=3, cursor="hand2"
+                relief="solid", bd=1, font=("Arial", 8, "bold"), padx=8, pady=2, cursor="hand2"
             )
-            btn_editar.pack(side="right", padx=(6, 0))
+            btn_editar.pack(side="right", padx=(4, 0))
 
         if perm == "ADMIN" and not cancelado:
             btn_excluir = tk.Button(
                 btn_area, text="Excluir",
                 command=lambda item=item: self._excluir_registro(item),
-                bg=BG_CARD, fg="#F30808", activebackground=BORDA, activeforeground=TEXTO,
-                relief="solid", bd=1, font=("Arial", 8, "bold"), padx=8, pady=3, cursor="hand2"
+                bg=BG_CARD, fg="#ff6b6b", activebackground=BORDA, activeforeground=TEXTO,
+                relief="solid", bd=1, font=("Arial", 8, "bold"), padx=8, pady=2, cursor="hand2"
             )
-            btn_excluir.pack(side="right", padx=(6, 0))
+            btn_excluir.pack(side="right", padx=(4, 0))
 
         if perm in ("ADMIN", "ENGENHARIA") and not cancelado:
             btn_atualizar_pn = tk.Button(
                 btn_area, text="Atualizar Flex PN",
-                command=lambda item=item, b=None: self._atualizar_pn_dashboard(item, b),
                 bg=BG_CARD, fg=ACCENT, activebackground=BORDA, activeforeground=TEXTO,
-                relief="solid", bd=1, font=("Arial", 8, "bold"), padx=8, pady=3, cursor="hand2"
+                relief="solid", bd=1, font=("Arial", 8, "bold"), padx=8, pady=2, cursor="hand2"
             )
-            btn_atualizar_pn.pack(side="right", padx=(6, 0))
+            btn_atualizar_pn.configure(
+                command=lambda item=item, b=btn_atualizar_pn: self._atualizar_pn_dashboard(item, b)
+            )
+            btn_atualizar_pn.pack(side="right", padx=(4, 0))
 
             phoenix_fechado = bool(str(item.get("phoenix_fechamento") or "").strip())
             pegasus_iniciado = bool(str(item.get("pegasus_abertura") or "").strip())
@@ -1882,9 +2397,20 @@ class PhoenixTool:
                     bg=BG_CARD, fg=ACCENT, relief="solid", bd=1, font=("Arial", 8, "bold"), padx=6, pady=2
                 ).pack(side="left", padx=2)
 
+        from services.database import limpar_descricao
         ticket = str(item.get("ticket") or "").strip()
-        descricao = str(item.get("description") or "Sem descrição").strip()
-        titulo_texto = f"{ticket} - {descricao}" if ticket else descricao
+        raw_desc = str(item.get("description") or "Sem descrição").strip()
+        desc_limpa = limpar_descricao(raw_desc)
+        if not desc_limpa or "muito alta" in desc_limpa.lower() or "\t" in desc_limpa:
+            desc_limpa = raw_desc if ("muito alta" not in raw_desc.lower() and "\t" not in raw_desc) else ""
+
+        if not desc_limpa:
+            desc_limpa = f"Solicitação Phoenix {ticket}".strip() if ticket else "Solicitação Phoenix"
+
+        if ticket and desc_limpa and desc_limpa != ticket and not desc_limpa.endswith(ticket):
+            titulo_texto = f"{ticket} - {desc_limpa}"
+        else:
+            titulo_texto = ticket or desc_limpa
 
         lbl_titulo = tk.Label(
             topo, text=titulo_texto, bg=BG_CARD, fg=TEXTO,
@@ -1893,20 +2419,52 @@ class PhoenixTool:
         lbl_titulo.pack(side="left", fill="x", expand=True)
 
         div = tk.Frame(corpo, bg=BORDA, height=1)
-        div.pack(fill="x", pady=(4, 10))
+        div.pack(fill="x", pady=(4, 8))
 
         info_frame = tk.Frame(corpo, bg=BG_CARD)
         info_frame.pack(fill="x")
 
+        # Stepper Visual de Fases (Phoenix -> Pegasus -> Custo)
+        phoenix_fechado = bool(str(item.get("phoenix_fechamento") or "").strip())
+        pegasus_iniciado = bool(str(item.get("pegasus_abertura") or "").strip())
+        pegasus_finalizado = bool(str(item.get("pegasus_fechamento") or "").strip())
+        custo_iniciado = bool(str(item.get("custo_abertura") or "").strip())
+        custo_finalizado = bool(str(item.get("custo_fechamento") or "").strip())
+
+        stepper_frame = tk.Frame(info_frame, bg=BG_CARD)
+        stepper_frame.pack(anchor="w", pady=(0, 6))
+
+        fases = [
+            ("Phoenix", phoenix_fechado, not phoenix_fechado and not cancelado),
+            ("Pegasus", pegasus_finalizado, pegasus_iniciado and not pegasus_finalizado and not cancelado),
+            ("Custo", custo_finalizado, custo_iniciado and not custo_finalizado and not cancelado),
+        ]
+
+        for idx_f, (nome_fase, concluiu, ativa) in enumerate(fases):
+            if concluiu:
+                st_bg, st_fg, st_txt = ("#163321", "#67d28d", f"✓ {nome_fase}")
+            elif ativa:
+                st_bg, st_fg, st_txt = ("#3a2d14", "#ffbf69", f"⚡ {nome_fase}")
+            else:
+                st_bg, st_fg, st_txt = (ENTRY_BG, TEXTO_MUTED, f"○ {nome_fase}")
+
+            tk.Label(
+                stepper_frame, text=st_txt, bg=st_bg, fg=st_fg,
+                font=("Arial", 7, "bold"), padx=6, pady=2
+            ).pack(side="left")
+
+            if idx_f < len(fases) - 1:
+                tk.Label(stepper_frame, text=" ➔ ", bg=BG_CARD, fg=TEXTO_MUTED, font=("Arial", 8)).pack(side="left")
+
         solicitante = str(item.get("solicitante") or "").strip() or "Não informado"
-        requisitante = str(item.get("requisitante") or "").strip() or "Não informado"
+        classificador = str(item.get("classificador") or item.get("requisitante") or "").strip() or "Não informado"
         data_abert = item.get("data_abertura", "—")
         hora_abert = item.get("hora_abertura", "")
         data_str = f"{data_abert} {hora_abert}".strip()
 
         tk.Label(
-            info_frame, text=f"Solicitante: {solicitante}   •   Requisitante: {requisitante}",
-            bg=BG_CARD, fg=TEXTO_MUTED, font=("Arial", 9)
+            info_frame, text=f"Solicitante: {solicitante}   •   Classificador: {classificador}",
+            bg=BG_CARD, fg=TEXTO, font=("Arial", 9, "bold")
         ).pack(anchor="w", pady=(0, 2))
 
         tk.Label(
@@ -1951,7 +2509,7 @@ class PhoenixTool:
                 f"Origem: {item.get('origem') or 'Não informado'}\n"
                 f"Custo: {item.get('custo') or 'Não informado'}\n\n"
                 f"Solicitante: {solicitante}\n"
-                f"Requisitante: {requisitante}\n\n"
+                f"Classificador: {classificador}\n\n"
                 f"--- AUDITORIA ---\n"
                 f"Criado por: {criador} em {criado_em}\n"
                 f"Última alteração: {ultima_alt} por {usr_alt}\n\n"
@@ -1963,6 +2521,38 @@ class PhoenixTool:
 
         for widget in (corpo, topo, info_frame, lbl_titulo):
             widget.bind("<Button-1>", mostrar_detalhes)
+
+    # Importar Planilha Excel de Solicitações Históricas
+    def _importar_planilha_excel(self):
+        if not self._validar_permissao("geral"):
+            return
+
+        caminho_arquivo = filedialog.askopenfilename(
+            title="Importar Planilha Excel de Solicitações Históricas",
+            filetypes=[("Planilhas Excel", "*.xlsx *.xls"), ("Todos os arquivos", "*.*")]
+        )
+
+        if not caminho_arquivo:
+            return
+
+        try:
+            res = importar_excel_historico(caminho_arquivo, usuario_importou=self.usuario)
+            messagebox.showinfo(
+                "Importação Concluída",
+                f"Planilha importada e alocada com sucesso!\n\n"
+                f"• Total de produtos processados: {res['total']}\n"
+                f"• Produtos Encerrados (Concluídos): {res['encerrados']}\n"
+                f"• Produtos Em Andamento: {res['em_andamento']}\n"
+                f"• Produtos Cancelados: {res['cancelados']}\n\n"
+                "Os produtos foram devidamente separados e organizados no Dashboard."
+            )
+            self._abrir_dashboard()
+        except Exception as exc:
+            logger.error("Erro ao importar planilha Excel: %s", exc)
+            messagebox.showerror(
+                "Erro na Importação",
+                f"Não foi possível processar a planilha selecionada:\n{exc}"
+            )
 
     # Exportar Dashboard para Excel
     def _exportar_dashboard(self):
@@ -2088,19 +2678,31 @@ class PhoenixTool:
             ws.title = "Registros"
 
             colunas = [
-                "Ticket", "Description", "Produto", "MPN", "PN", "Solicitante",
-                "Data Abertura Phoenix", "Data Abertura Pegasus", "Data Abertura Cost",
-                "Data Fechamento"
+                "Ticket", "Solicitante", "Classificador", "DESCRIPTION", "PRODUTO", "FLEX PN",
+                "FXB Status", "FXB OPEN", "FXB CLOSE",
+                "CF", "CF OPEN", "CF CLOSE",
+                "CUSTO", "CUSTO OPEN", "CUSTO CLOSE"
             ]
             ws.append(colunas)
 
-            # Estilo do cabeçalho
-            header_fill = PatternFill(start_color="1F497D", end_color="1F497D", fill_type="solid")
-            header_font = Font(name="Arial", size=10, bold=True, color="FFFFFF")
-            for cell in ws[1]:
-                cell.fill = header_fill
-                cell.font = header_font
-                cell.alignment = Alignment(horizontal="center", vertical="center")
+            # Estilo dos cabeçalhos combinando com as imagens de referência
+            gold_fill = PatternFill(start_color="FFC000", end_color="FFC000", fill_type="solid")
+            blue_fill = PatternFill(start_color="4F81BD", end_color="4F81BD", fill_type="solid")
+            header_font_dark = Font(name="Arial", size=9, bold=True, color="000000")
+            header_font_light = Font(name="Arial", size=9, bold=True, color="FFFFFF")
+
+            for idx, cell in enumerate(ws[1], start=1):
+                cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+                if idx in (6, 7, 8, 9):  # FLEX PN, FXB Status, FXB OPEN, FXB CLOSE
+                    cell.fill = blue_fill
+                    cell.font = header_font_light
+                else:
+                    cell.fill = gold_fill
+                    cell.font = header_font_dark
+
+            green_row_fill = PatternFill(start_color="C6EFCE", end_color="C6EFCE", fill_type="solid")
+            green_row_font = Font(name="Arial", size=9, color="006100")
+            normal_font = Font(name="Arial", size=9, color="000000")
 
             thin_border = Border(
                 left=Side(style='thin', color='D9D9D9'),
@@ -2109,33 +2711,77 @@ class PhoenixTool:
                 bottom=Side(style='thin', color='D9D9D9')
             )
 
+            from services.database import limpar_descricao, _parse_data_hora_generica
+
+            def fmt_dt(val):
+                val_str = str(val or "").strip()
+                if not val_str:
+                    return ""
+                dt = _parse_data_hora_generica(val_str)
+                return dt.strftime("%d-%b-%y") if dt else val_str
+
             for item in historico:
-                ticket = str(item.get("ticket") or "")
-                desc = str(item.get("description") or "")
-                prod = str(item.get("produto") or "")
-                mpn = str(item.get("mpn") or "")
-                pn = str(item.get("pn") or item.get("part_number") or "")
-                solic = str(item.get("solicitante") or "")
-                dt_phx = str(item.get("phoenix_data_abertura") or item.get("data_abertura") or "")
-                dt_peg = str(item.get("pegasus_data_abertura") or item.get("data_abertura") or "")
-                dt_cost = str(item.get("custo_data_abertura") or item.get("data_abertura") or "")
-                dt_fech = str(item.get("data_fechamento") or "")
+                solic = str(item.get("solicitante") or "").strip()
+                classif = str(item.get("classificador") or item.get("requisitante") or item.get("criado_por") or "").strip()
+
+                ticket = str(item.get("ticket") or "").strip()
+                raw_desc = str(item.get("description") or "").strip()
+                desc = limpar_descricao(raw_desc) or raw_desc
+                if "muito alta" in desc.lower() or "\t" in desc:
+                    desc = f"Solicitação Phoenix {ticket}".strip() if ticket else "Solicitação Phoenix"
+
+                prod = str(item.get("produto") or "").strip()
+                pn = str(item.get("pn") or item.get("part_number") or "").strip()
+
+                status_raw = str(item.get("status") or "").strip().upper()
+                cancelado = bool(item.get("cancelado")) or status_raw == "CANCELADO"
+
+                # Phoenix / FXB
+                fxb_op_raw = item.get("data_abertura") or ""
+                fxb_cl_raw = item.get("phoenix_fechamento") or ""
+                fxb_op = fmt_dt(fxb_op_raw)
+                fxb_cl = fmt_dt(fxb_cl_raw)
+                fxb_st = "CANCELADO" if cancelado else ("OK" if fxb_cl_raw else ("ON GOING" if fxb_op_raw else "OPEN"))
+
+                # Pegasus / CF
+                cf_op_raw = item.get("pegasus_abertura") or ""
+                cf_cl_raw = item.get("pegasus_fechamento") or ""
+                cf_op = fmt_dt(cf_op_raw)
+                cf_cl = fmt_dt(cf_cl_raw)
+                cf_st = "CANCELADO" if cancelado else ("OK" if cf_cl_raw else ("ON GOING" if cf_op_raw else "OPEN"))
+
+                # Custo
+                cst_op_raw = item.get("custo_abertura") or ""
+                cst_cl_raw = item.get("custo_fechamento") or ""
+                cst_op = fmt_dt(cst_op_raw)
+                cst_cl = fmt_dt(cst_cl_raw)
+                cst_fin = bool(cst_cl_raw) or (bool(item.get("custo_finalizado")) and bool(cst_cl_raw))
+                cst_st = "CANCELADO" if cancelado else ("OK" if cst_fin else ("ON GOING" if cst_op_raw else "OPEN"))
 
                 row_vals = [
-                    ticket, desc, prod, mpn, pn, solic,
-                    dt_phx, dt_peg, dt_cost, dt_fech
+                    ticket, solic, classif, desc, prod, pn,
+                    fxb_st, fxb_op, fxb_cl,
+                    cf_st, cf_op, cf_cl,
+                    cst_st, cst_op, cst_cl
                 ]
                 ws.append(row_vals)
 
                 row_idx = ws.max_row
+                is_ok = (cst_fin and not cancelado)
                 for col_idx in range(1, len(colunas) + 1):
-                    ws.cell(row=row_idx, column=col_idx).border = thin_border
+                    cell = ws.cell(row=row_idx, column=col_idx)
+                    cell.border = thin_border
+                    if is_ok:
+                        cell.fill = green_row_fill
+                        cell.font = green_row_font
+                    else:
+                        cell.font = normal_font
 
             # Auto ajuste de colunas
             for col in ws.columns:
                 max_len = max(len(str(cell.value or '')) for cell in col)
                 col_letter = get_column_letter(col[0].column)
-                ws.column_dimensions[col_letter].width = min(max(max_len + 3, 10), 50)
+                ws.column_dimensions[col_letter].width = min(max(max_len + 3, 12), 50)
 
             # Filtro automático e congelamento de primeira linha
             ws.auto_filter.ref = ws.dimensions
@@ -2155,12 +2801,23 @@ class PhoenixTool:
             messagebox.showwarning("Atualizar Flex PN", "Este registro não possui ticket.")
             return
 
-        if botao is not None and botao.winfo_exists():
-            botao.configure(state="disabled", text="Buscando...")
+        cred = self._obter_ou_pedir_credencial("Phoenix")
+        if not cred or not cred.get("login") or not cred.get("senha"):
+            return
+
+        cred_user = cred["login"]
+        cred_pass = cred["senha"]
+
+        if botao is not None:
+            try:
+                if botao.winfo_exists():
+                    botao.configure(state="disabled", text="⏳ Buscando PN...")
+            except Exception:
+                pass
 
         def _worker():
             from automocoes.phoenix.atualizar_pn import buscar_pn_por_ticket
-            resultado = buscar_pn_por_ticket(ticket)
+            resultado = buscar_pn_por_ticket(ticket, cred_user=cred_user, cred_pass=cred_pass)
             self.root.after(0, lambda: self._finalizar_atualizacao_pn(resultado, botao))
 
         threading.Thread(target=_worker, daemon=True).start()
@@ -2274,7 +2931,8 @@ class PhoenixTool:
         cred = self._obter_ou_pedir_credencial("PHOENIX")
         if not cred:
             return
-        executar_script("automocoes", "phoenix", "phoenix.py", arg=arg, cred_user=cred["login"], cred_pass=cred["senha"], tool_user=self.usuario)
+        inv = arg in ("capturar", "importar")
+        executar_script("automocoes", "phoenix", "phoenix.py", arg=arg, cred_user=cred["login"], cred_pass=cred["senha"], tool_user=self.usuario, invisible=inv)
 
     def _build_menu_phoenix(self):
         if FRAME_MENU_PHOENIX in self.frames:
@@ -2290,7 +2948,7 @@ class PhoenixTool:
                 ("Home Phoenix", lambda: self._executar_phoenix(arg="home"), "Retorna ao fluxo inicial"),
                 ("Nova solicitação", lambda: self._executar_phoenix(), "Inicia uma nova solicitação"),
                 ("Atualizar Flex PN", self._abrir_atualizar_pn_phoenix, "Busca e atualiza o PN"),
-                ("Importar solicitações existentes", lambda: self._executar_phoenix(arg="importar"), "Traz tickets já criados"),
+                ("Capturar/Importar Solicitações", lambda: self._executar_phoenix(arg="capturar"), "Varre o Phoenix e captura tickets abertos não registrados"),
             ],
         )
 
@@ -2587,7 +3245,7 @@ class PhoenixTool:
             btn_del = tk.Button(
                 col_right, text="Excluir",
                 command=lambda uid=u_id, unome=u["nome"]: self._excluir_usuario_confirm(uid, unome),
-                bg=BG_CARD, fg="#ff0505ff", relief="flat", bd=0, font=("Arial", 9, "bold"), padx=8, pady=4, cursor="hand2"
+                bg=BG_CARD, fg="#ff0505", relief="flat", bd=0, font=("Arial", 9, "bold"), padx=8, pady=4, cursor="hand2"
             )
             btn_del.pack(side="left", padx=4)
 
@@ -2812,6 +3470,813 @@ class PhoenixTool:
             else:
                 reativar_usuario(user_id)
             self._abrir_administracao()
+
+
+    # =====================================================================
+    # CENTRAL DE AJUDA / TUTORIAL INTERATIVO
+    # =====================================================================
+    def _abrir_ajuda(self):
+        """Abre a Central de Ajuda com tutorial completo da ferramenta."""
+        ajuda = tk.Toplevel(self.root)
+        ajuda.title("Central de Ajuda — Flex-tax Classification")
+        ajuda.geometry("920x700")
+        ajuda.configure(bg=BG)
+        ajuda.transient(self.root)
+        ajuda.grab_set()
+
+        # Tentar centralizar
+        ajuda.update_idletasks()
+        w = ajuda.winfo_width()
+        h = ajuda.winfo_height()
+        x = (ajuda.winfo_screenwidth() // 2) - (w // 2)
+        y = (ajuda.winfo_screenheight() // 2) - (h // 2)
+        ajuda.geometry(f"+{x}+{y}")
+
+        # Header
+        hdr = tk.Frame(ajuda, bg=ACCENT, height=60)
+        hdr.pack(fill="x")
+        hdr.pack_propagate(False)
+        tk.Label(hdr, text="📖  CENTRAL DE AJUDA", bg=ACCENT, fg="#ffffff", font=("Arial", 16, "bold")).pack(side="left", padx=20, pady=12)
+        tk.Label(hdr, text="Flex-tax Classification v1.0", bg=ACCENT, fg="#ffe0c0", font=("Arial", 9)).pack(side="right", padx=20)
+
+        # Sidebar + Content area
+        body = tk.Frame(ajuda, bg=BG)
+        body.pack(fill="both", expand=True)
+
+        sidebar = tk.Frame(body, bg=BG_CARD, width=200, bd=0, highlightthickness=0)
+        sidebar.pack(side="left", fill="y")
+        sidebar.pack_propagate(False)
+
+        content_area = tk.Frame(body, bg=BG)
+        content_area.pack(side="left", fill="both", expand=True)
+
+        # Scrollable content
+        canvas = tk.Canvas(content_area, bg=BG, highlightthickness=0, bd=0)
+        scrollbar = tk.Scrollbar(content_area, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=scrollbar.set)
+
+        scrollbar.pack(side="right", fill="y")
+        canvas.pack(side="left", fill="both", expand=True)
+
+        content_frame = tk.Frame(canvas, bg=BG)
+        content_window = canvas.create_window((0, 0), window=content_frame, anchor="nw")
+
+        def _atualizar_scroll(event=None):
+            canvas.configure(scrollregion=canvas.bbox("all"))
+
+        def _ajustar_largura(event):
+            canvas.itemconfig(content_window, width=event.width)
+
+        content_frame.bind("<Configure>", _atualizar_scroll)
+        canvas.bind("<Configure>", _ajustar_largura)
+
+        def _scroll(event):
+            canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+
+        canvas.bind_all("<MouseWheel>", _scroll)
+        ajuda.protocol("WM_DELETE_WINDOW", lambda: (canvas.unbind_all("<MouseWheel>"), ajuda.destroy()))
+
+        # ------------------------------------------------------------------
+        # Helpers de renderização
+        # ------------------------------------------------------------------
+        def _limpar():
+            for w in content_frame.winfo_children():
+                w.destroy()
+            canvas.yview_moveto(0)
+
+        def _titulo_secao(texto, icone=""):
+            f = tk.Frame(content_frame, bg=ACCENT, height=3)
+            f.pack(fill="x", padx=24, pady=(20, 0))
+            tk.Label(content_frame, text=f"{icone}  {texto}", bg=BG, fg=TEXTO, font=("Arial", 18, "bold")).pack(anchor="w", padx=28, pady=(12, 4))
+
+        def _subtitulo(texto):
+            tk.Label(content_frame, text=texto, bg=BG, fg=ACCENT, font=("Arial", 13, "bold")).pack(anchor="w", padx=28, pady=(14, 4))
+
+        def _paragrafo(texto):
+            lbl = tk.Label(content_frame, text=texto, bg=BG, fg=TEXTO, font=("Arial", 10), wraplength=620, justify="left")
+            lbl.pack(anchor="w", padx=32, pady=(2, 6))
+
+        def _bullet(texto, indent=40):
+            tk.Label(content_frame, text=f"  •  {texto}", bg=BG, fg=TEXTO, font=("Arial", 10), wraplength=600, justify="left").pack(anchor="w", padx=indent, pady=1)
+
+        def _dica(texto):
+            f = tk.Frame(content_frame, bg="#1a3a1a" if tema_atual() == "dark" else "#e8f5e9", bd=0, highlightthickness=1, highlightbackground="#4caf50")
+            f.pack(fill="x", padx=32, pady=(6, 8))
+            tk.Label(f, text=f"💡 DICA: {texto}", bg=f.cget("bg"), fg="#4caf50" if tema_atual() == "dark" else "#2e7d32", font=("Arial", 9, "bold"), wraplength=580, justify="left").pack(anchor="w", padx=12, pady=8)
+
+        def _aviso(texto):
+            f = tk.Frame(content_frame, bg="#3a2a0a" if tema_atual() == "dark" else "#fff3e0", bd=0, highlightthickness=1, highlightbackground=ACCENT)
+            f.pack(fill="x", padx=32, pady=(6, 8))
+            tk.Label(f, text=f"⚠️ ATENÇÃO: {texto}", bg=f.cget("bg"), fg=ACCENT, font=("Arial", 9, "bold"), wraplength=580, justify="left").pack(anchor="w", padx=12, pady=8)
+
+        def _tabela(headers, rows):
+            """Desenha uma tabela formatada dentro do content_frame."""
+            tbl = tk.Frame(content_frame, bg=BORDA, bd=1, relief="solid")
+            tbl.pack(fill="x", padx=32, pady=(6, 10))
+
+            # Cabeçalho
+            hdr_frame = tk.Frame(tbl, bg=ACCENT)
+            hdr_frame.pack(fill="x")
+            for j, h in enumerate(headers):
+                cell = tk.Label(hdr_frame, text=h, bg=ACCENT, fg="#ffffff", font=("Arial", 9, "bold"), padx=10, pady=6, anchor="w")
+                cell.grid(row=0, column=j, sticky="nsew", padx=(0, 1))
+                hdr_frame.grid_columnconfigure(j, weight=1)
+
+            # Linhas
+            for i, row in enumerate(rows):
+                row_bg = BG_CARD if i % 2 == 0 else BG
+                row_frame = tk.Frame(tbl, bg=row_bg)
+                row_frame.pack(fill="x")
+                for j, val in enumerate(row):
+                    cell = tk.Label(row_frame, text=val, bg=row_bg, fg=TEXTO, font=("Arial", 9), padx=10, pady=5, anchor="w", wraplength=250)
+                    cell.grid(row=0, column=j, sticky="nsew", padx=(0, 1))
+                    row_frame.grid_columnconfigure(j, weight=1)
+
+        def _diagrama_fluxo(etapas):
+            """Desenha um diagrama de fluxo horizontal com setas."""
+            f = tk.Frame(content_frame, bg=BG)
+            f.pack(fill="x", padx=32, pady=(8, 12))
+            for i, (icone, texto, cor) in enumerate(etapas):
+                box = tk.Frame(f, bg=cor, bd=0, highlightthickness=1, highlightbackground=BORDA)
+                box.pack(side="left", padx=2, pady=4)
+                tk.Label(box, text=icone, bg=cor, fg="#ffffff", font=("Arial", 14)).pack(padx=8, pady=(6, 0))
+                tk.Label(box, text=texto, bg=cor, fg="#ffffff", font=("Arial", 8, "bold"), wraplength=90).pack(padx=8, pady=(0, 6))
+                if i < len(etapas) - 1:
+                    tk.Label(f, text="→", bg=BG, fg=ACCENT, font=("Arial", 16, "bold")).pack(side="left", padx=2)
+
+        def _separador():
+            tk.Frame(content_frame, bg=BORDA, height=1).pack(fill="x", padx=28, pady=(16, 8))
+
+        # ------------------------------------------------------------------
+        # Conteúdo de cada seção
+        # ------------------------------------------------------------------
+        def _show_visao_geral():
+            _limpar()
+            _titulo_secao("Visão Geral do Sistema", "🏠")
+            _paragrafo(
+                "O Flex-tax Classification é uma ferramenta corporativa para gerenciar "
+                "solicitações de classificação fiscal de componentes eletrônicos. "
+                "Ele automatiza o fluxo de trabalho entre três sistemas: Phoenix, Pegasus e Cost."
+            )
+
+            _subtitulo("Fluxo Completo de uma Solicitação")
+            _diagrama_fluxo([
+                ("🦅", "PHOENIX\nAbrir Solicitação", "#1565c0"),
+                ("📋", "PEGASUS\nRegistrar Item", "#6a1b9a"),
+                ("💰", "CUSTO\nAnálise Fiscal", "#e65100"),
+                ("✅", "FINALIZADO\nPN Atribuído", "#2e7d32"),
+            ])
+
+            _paragrafo(
+                "Cada solicitação passa pelas etapas acima. A ferramenta registra "
+                "automaticamente as datas de abertura e fechamento de cada fase, "
+                "permitindo rastreabilidade total do processo."
+            )
+
+            _subtitulo("Estrutura da Ferramenta")
+            _tabela(
+                ["Módulo", "Função", "Acesso"],
+                [
+                    ["Dashboard", "Painel central com todos os registros, gráficos e exportações", "Todos"],
+                    ["Phoenix", "Abrir novas solicitações e capturar tickets do sistema Phoenix", "Engenharia / Admin"],
+                    ["Pegasus", "Registrar itens no sistema Pegasus", "Engenharia / Admin"],
+                    ["Credenciais", "Salvar login/senha dos sistemas (protegido por PIN)", "Engenharia / Admin"],
+                    ["Administração", "Gerenciar usuários, backups e configurações", "Admin"],
+                ]
+            )
+
+            _dica("Use a barra de navegação inferior (DASHBOARD • PHOENIX • PEGASUS • CREDENCIAIS • ADMINISTRAÇÃO) para navegar rapidamente entre os módulos.")
+
+        def _show_dashboard():
+            _limpar()
+            _titulo_secao("Dashboard", "📊")
+            _paragrafo(
+                "O Dashboard é a tela principal da ferramenta. Ele mostra todas as "
+                "solicitações registradas, estatísticas em tempo real e permite "
+                "realizar ações em cada registro."
+            )
+
+            _subtitulo("Cards de Estatísticas")
+            _paragrafo(
+                "No topo do dashboard, 4 cards mostram a contagem de solicitações:"
+            )
+            _tabela(
+                ["Card", "O que mostra", "Cor"],
+                [
+                    ["Total", "Quantidade total de solicitações registradas", "Branco"],
+                    ["Em Andamento", "Solicitações com status 'ON GOING'", "Azul"],
+                    ["Finalizadas", "Solicitações concluídas com sucesso", "Verde"],
+                    ["Canceladas", "Solicitações canceladas/excluídas", "Vermelho"],
+                ]
+            )
+
+            _subtitulo("Gráfico de Pizza")
+            _paragrafo(
+                "O gráfico donut mostra a distribuição percentual das solicitações "
+                "entre Em Andamento, Finalizadas e Canceladas. Ele é atualizado "
+                "automaticamente ao abrir o dashboard."
+            )
+
+            _subtitulo("Barra de Ações")
+            _tabela(
+                ["Botão", "Ação"],
+                [
+                    ["Atualizar", "Recarrega o dashboard com os dados mais recentes"],
+                    ["Capturar Phoenix", "Abre o Phoenix invisível e captura tickets que não foram registrados"],
+                    ["Exp. Dashboard", "Exporta um resumo em Excel (.xlsx) com métricas e indicadores"],
+                    ["Exp. Registros", "Exporta todos os registros para Excel com datas de abertura/fechamento por fase"],
+                    ["Esvaziar Lixeira", "Remove permanentemente os registros cancelados"],
+                ]
+            )
+
+            _subtitulo("Filtros e Busca")
+            _paragrafo(
+                "Use os filtros (Todos / Em Andamento / Finalizadas / Lixeira) para visualizar "
+                "apenas registros de um determinado status. A barra de busca filtra por "
+                "ticket, description, MPN, PN ou solicitante."
+            )
+
+            _subtitulo("Botões em Cada Registro")
+            _tabela(
+                ["Botão", "Quando aparece", "O que faz"],
+                [
+                    ["Finalizar Phoenix", "Quando o status é ON GOING", "Marca a fase Phoenix como fechada e registra a data"],
+                    ["Iniciar Pegasus", "Após Phoenix fechado", "Registra a data de abertura do Pegasus"],
+                    ["Finalizar Pegasus", "Pegasus iniciado", "Marca o Pegasus como fechado"],
+                    ["Iniciar Custo", "Após Pegasus fechado", "Registra a abertura da análise de Custo"],
+                    ["Finalizar Custo", "Custo iniciado", "Conclui a análise de custo"],
+                    ["Atualizar Flex PN", "Sempre", "Busca o Part Number atribuído no Phoenix"],
+                    ["Editar", "Sempre", "Abre um formulário para editar os campos do registro"],
+                    ["Excluir", "Sempre", "Cancela/exclui o registro (vai para a lixeira)"],
+                ]
+            )
+
+            _dica("Clique no ticket ou na description de qualquer registro para ver os detalhes completos.")
+            _aviso("Registros excluídos vão para a lixeira. Use 'Esvaziar Lixeira' para removê-los permanentemente.")
+
+        def _show_phoenix():
+            _limpar()
+            _titulo_secao("Módulo Phoenix", "🦅")
+            _paragrafo(
+                "O módulo Phoenix automatiza a criação de novas solicitações de classificação "
+                "fiscal no sistema Phoenix da Flex."
+            )
+
+            _subtitulo("Fluxo: Nova Solicitação")
+            _diagrama_fluxo([
+                ("1️⃣", "Selecionar\nTemplate Excel", "#1565c0"),
+                ("2️⃣", "Upload +\nClique na Lupa", "#0277bd"),
+                ("3️⃣", "Preencher\nManualmente", "#00838f"),
+                ("4️⃣", "Confirmar\nSolicitação", "#00695c"),
+                ("5️⃣", "Ticket\nCapturado", "#2e7d32"),
+            ])
+
+            _paragrafo("Passo a passo detalhado:")
+            _bullet("1. Clique em 'Nova Solicitação' no menu Phoenix")
+            _bullet("2. O navegador Chromium abre automaticamente e faz login no Phoenix")
+            _bullet("3. Selecione o Task P0032 (preenchido automaticamente)")
+            _bullet("4. Escolha o arquivo template Excel (.xlsx) com os itens")
+            _bullet("5. O template é carregado e a Lupa é clicada automaticamente")
+            _bullet("6. A ferramenta captura a Description e o MPN do formulário")
+            _bullet("7. Campos automáticos: Area, Priority, Company, Item Type, ROHS, Origin")
+            _bullet("8. VOCÊ preenche manualmente: Assunto Principal e Manufacturer")
+            _bullet("9. Clique em 'Confirmar Solicitação' no Phoenix")
+            _bullet("10. O ticket é capturado automaticamente e salvo no Dashboard")
+
+            _dica("O template Excel deve ter colunas 'Description' e 'MPN' na aba 'Items' ou 'Template'.")
+            _aviso("NÃO feche o navegador antes de confirmar a solicitação! A ferramenta precisa detectar a mudança de URL para capturar o ticket.")
+
+            _separador()
+
+            _subtitulo("Capturar Phoenix (Sincronização)")
+            _paragrafo(
+                "O botão 'Capturar Phoenix' no Dashboard permite importar solicitações "
+                "que foram abertas diretamente no Phoenix (sem a ferramenta) e que ainda "
+                "não estão no Dashboard."
+            )
+            _bullet("Funciona 100% invisível (headless) — nenhuma janela abre")
+            _bullet("Faz login automático no Phoenix")
+            _bullet("Navega para 'Minhas Solicitações'")
+            _bullet("Compara cada ticket com o banco local")
+            _bullet("Insere automaticamente os tickets que não existem no Dashboard")
+
+            _dica("Use esse botão sempre que abrir solicitações diretamente pelo Phoenix para manter o Dashboard sincronizado.")
+
+        def _show_pegasus():
+            _limpar()
+            _titulo_secao("Módulo Pegasus", "📋")
+            _paragrafo(
+                "O módulo Pegasus permite registrar os itens no sistema Pegasus após "
+                "a fase do Phoenix ser concluída."
+            )
+
+            _subtitulo("Fluxo do Pegasus")
+            _diagrama_fluxo([
+                ("✅", "Phoenix\nFechado", "#2e7d32"),
+                ("▶️", "Iniciar\nPegasus", "#6a1b9a"),
+                ("📋", "Preencher\nno Pegasus", "#7b1fa2"),
+                ("⏹️", "Finalizar\nPegasus", "#4a148c"),
+            ])
+
+            _paragrafo("Como usar:")
+            _bullet("1. No Dashboard, clique 'Iniciar Pegasus' no registro desejado")
+            _bullet("2. A data de abertura do Pegasus é registrada automaticamente")
+            _bullet("3. Após concluir o trabalho no Pegasus, clique 'Finalizar Pegasus'")
+            _bullet("4. A data de fechamento é registrada e o registro avança para a fase de Custo")
+
+            _dica("Você pode usar o módulo Pegasus do menu lateral para abrir o sistema Pegasus automaticamente com login preenchido.")
+
+        def _show_custo():
+            _limpar()
+            _titulo_secao("Módulo Cost (Custo)", "💰")
+            _paragrafo(
+                "O módulo de Custo é a última fase do processo de classificação fiscal. "
+                "Aqui é feita a análise fiscal e atribuição do Part Number final."
+            )
+
+            _subtitulo("Fluxo do Custo")
+            _diagrama_fluxo([
+                ("✅", "Pegasus\nFechado", "#4a148c"),
+                ("▶️", "Iniciar\nCusto", "#e65100"),
+                ("💰", "Análise\nFiscal", "#f57c00"),
+                ("⏹️", "Finalizar\nCusto", "#bf360c"),
+                ("🏁", "FINALIZADO", "#2e7d32"),
+            ])
+
+            _paragrafo("Como usar:")
+            _bullet("1. No Dashboard, clique 'Iniciar Custo' após o Pegasus ser finalizado")
+            _bullet("2. A data de abertura do Custo é registrada")
+            _bullet("3. Realize a análise fiscal e atribua o Part Number")
+            _bullet("4. Clique 'Finalizar Custo' para concluir a solicitação")
+            _bullet("5. O registro muda para status FINALIZADO com a data de fechamento geral")
+
+            _aviso("Após finalizar o custo, o registro é considerado concluído. Verifique se o Flex PN está correto antes de finalizar.")
+
+        def _show_ciclo_vida():
+            _limpar()
+            _titulo_secao("Ciclo de Vida de um Registro", "🔄")
+            _paragrafo(
+                "Cada solicitação registrada no Dashboard passa por diversas fases. "
+                "A ferramenta controla automaticamente as datas de cada transição."
+            )
+
+            _subtitulo("Fases e Datas")
+            _tabela(
+                ["Fase", "Campo Abertura", "Campo Fechamento", "Quando é preenchido"],
+                [
+                    ["Phoenix", "data_abertura + hora_abertura", "phoenix_fechamento", "Ao criar / Ao clicar 'Finalizar Phoenix'"],
+                    ["Pegasus", "pegasus_abertura", "pegasus_fechamento", "Ao clicar 'Iniciar Pegasus' / 'Finalizar Pegasus'"],
+                    ["Custo", "custo_abertura", "custo_fechamento", "Ao clicar 'Iniciar Custo' / 'Finalizar Custo'"],
+                    ["Geral", "criado_em", "data_fechamento", "Ao criar / Ao finalizar todas as fases"],
+                ]
+            )
+
+            _subtitulo("Status Possíveis")
+            _tabela(
+                ["Status", "Significado", "Cor no Dashboard"],
+                [
+                    ["ON GOING", "Solicitação em andamento (qualquer fase ativa)", "🔵 Azul"],
+                    ["FINALIZADO", "Todas as fases concluídas com sucesso", "🟢 Verde"],
+                    ["CANCELADO", "Registro excluído/cancelado pelo usuário", "🔴 Vermelho"],
+                ]
+            )
+
+            _subtitulo("Diagrama Visual")
+            _diagrama_fluxo([
+                ("📝", "CRIAÇÃO", "#1565c0"),
+                ("🦅", "PHOENIX", "#0277bd"),
+                ("📋", "PEGASUS", "#6a1b9a"),
+                ("💰", "CUSTO", "#e65100"),
+                ("✅", "FINALIZADO", "#2e7d32"),
+            ])
+
+            _dica("Na exportação para Excel, cada fase tem suas próprias colunas de data de abertura e fechamento.")
+
+        def _show_exportacao():
+            _limpar()
+            _titulo_secao("Exportação de Dados", "📤")
+            _paragrafo(
+                "A ferramenta oferece duas formas de exportação para planilhas Excel (.xlsx):"
+            )
+
+            _subtitulo("1. Exportar Dashboard")
+            _paragrafo(
+                "Gera um Excel com duas abas:"
+            )
+            _bullet("Aba 'Resumo': Total de Solicitações, Em Andamento, Finalizadas, Canceladas")
+            _bullet("Aba 'Indicadores': Status com quantidade e percentual")
+
+            _subtitulo("2. Exportar Registros")
+            _paragrafo(
+                "Gera um Excel completo com todos os registros e suas informações detalhadas:"
+            )
+            _tabela(
+                ["Coluna", "Descrição"],
+                [
+                    ["Ticket", "Código da solicitação no Phoenix (ex: TKGP2026080521)"],
+                    ["Description", "Descrição limpa do item"],
+                    ["Produto", "Nome do produto"],
+                    ["MPN", "Manufacturer Part Number"],
+                    ["Flex PN", "Part Number atribuído pela Flex"],
+                    ["Status", "EM ANDAMENTO / FINALIZADA / CANCELADA"],
+                    ["Solicitante / Requisitante", "Quem solicitou a classificação"],
+                    ["Data Abertura Phoenix", "Data + hora de criação da solicitação"],
+                    ["Data Fechamento Phoenix", "Data em que a fase Phoenix foi finalizada"],
+                    ["Data Abertura Pegasus", "Data de início da fase Pegasus"],
+                    ["Data Fechamento Pegasus", "Data de encerramento do Pegasus"],
+                    ["Data Abertura Custo", "Data de início da análise de custo"],
+                    ["Data Fechamento Custo", "Data de conclusão do custo"],
+                    ["Data Fechamento Geral", "Data final de conclusão de todo o processo"],
+                    ["Criado Por / Criado Em", "Quem e quando criou o registro"],
+                ]
+            )
+
+            _dica("Ao exportar registros, você pode escolher exportar TODOS ou apenas os registros do filtro/busca atual.")
+
+        def _show_credenciais():
+            _limpar()
+            _titulo_secao("Credenciais", "🔑")
+            _paragrafo(
+                "O módulo de Credenciais permite salvar seus logins e senhas dos sistemas "
+                "Phoenix, Pegasus e Cost de forma segura, protegidos por um PIN pessoal."
+            )
+
+            _subtitulo("Como funciona")
+            _bullet("1. No primeiro acesso, defina um PIN de 4+ dígitos")
+            _bullet("2. Cadastre login e senha para cada sistema (Phoenix, Pegasus, Cost)")
+            _bullet("3. As credenciais são criptografadas com AES usando seu PIN")
+            _bullet("4. Ao executar automações, basta digitar seu PIN para desbloquear")
+
+            _subtitulo("Sistemas disponíveis")
+            _tabela(
+                ["Sistema", "Para quê serve"],
+                [
+                    ["Phoenix", "Login automático no Phoenix para novas solicitações"],
+                    ["Pegasus", "Login automático no Pegasus"],
+                    ["Cost", "Login automático no sistema de análise de custo"],
+                ]
+            )
+
+            _aviso("Se você esquecer seu PIN, peça a um administrador para resetá-lo. As credenciais salvas serão perdidas e precisarão ser recadastradas.")
+            _dica("Seu PIN nunca é salvo em texto puro — apenas o hash é armazenado. Nem mesmo administradores podem ver suas senhas.")
+
+        def _show_admin():
+            _limpar()
+            _titulo_secao("Administração", "⚙️")
+            _paragrafo(
+                "O painel de Administração (acesso exclusivo para ADMIN) permite "
+                "gerenciar usuários, backups e configurações do sistema."
+            )
+
+            _subtitulo("Gerenciamento de Usuários")
+            _tabela(
+                ["Ação", "Descrição"],
+                [
+                    ["Adicionar", "Cria um novo usuário com nome, código e nível de permissão"],
+                    ["Editar", "Altera nome, código ou permissão de um usuário existente"],
+                    ["Desativar", "Impede o login do usuário sem excluí-lo"],
+                    ["Reativar", "Reativa um usuário desativado"],
+                    ["Excluir", "Remove permanentemente o usuário do sistema"],
+                ]
+            )
+
+            _subtitulo("Níveis de Permissão")
+            _tabela(
+                ["Nível", "Acesso"],
+                [
+                    ["ADMIN", "Acesso total: Dashboard, Phoenix, Pegasus, Credenciais, Administração, Exportação"],
+                    ["ENGENHARIA", "Dashboard, Phoenix, Pegasus, Credenciais, Exportação (sem Administração)"],
+                    ["USUARIO", "Apenas Dashboard, Consulta e Exportação (somente leitura)"],
+                ]
+            )
+
+            _subtitulo("Backup do Banco de Dados")
+            _bullet("Backups são criados automaticamente na inicialização")
+            _bullet("Use 'Backup Manual' para criar um backup imediato")
+            _bullet("Backups antigos são removidos automaticamente (mantém os 10 mais recentes)")
+            _bullet("O banco pode ser relocado para outro caminho (rede, USB, etc.)")
+
+            _dica("Exporte os usuários para JSON periodicamente como backup adicional. Isso permite importar em caso de perda do banco.")
+
+        def _show_atalhos():
+            _limpar()
+            _titulo_secao("Atalhos e Dicas", "⚡")
+
+            _subtitulo("Atalhos de Navegação")
+            _tabela(
+                ["Ação", "Como fazer"],
+                [
+                    ["Alternar tema (Claro/Escuro)", "Clique no ícone 🌙/☀️ no rodapé"],
+                    ["Notificações", "Clique no ícone 🔔 no cabeçalho"],
+                    ["Ajuda (esta tela)", "Clique no ícone ❓ no cabeçalho"],
+                    ["Tela cheia", "Duplo clique na barra de título"],
+                    ["Buscar no Dashboard", "Digite na barra de busca (canto superior direito do dashboard)"],
+                ]
+            )
+
+            _subtitulo("Dicas de Produtividade")
+            _bullet("Use 'Capturar Phoenix' para importar solicitações abertas diretamente no site")
+            _bullet("Sempre salve suas credenciais para evitar digitar login/senha toda vez")
+            _bullet("Exporte registros para Excel para compartilhar com sua equipe")
+            _bullet("Use os filtros do dashboard para focar apenas nos registros relevantes")
+            _bullet("O dashboard atualiza automaticamente — mas você pode clicar 'Atualizar' para forçar")
+
+            _subtitulo("Solução de Problemas")
+            _tabela(
+                ["Problema", "Solução"],
+                [
+                    ["Navegador não abre", "Verifique se o Chromium do Playwright está instalado. Na primeira execução, ele é instalado automaticamente."],
+                    ["Ticket não foi capturado", "Use 'Capturar Phoenix' no dashboard para sincronizar"],
+                    ["Description mostra 'Muito Alta'", "A ferramenta limpa automaticamente essas descrições. Se persistir, edite o registro manualmente."],
+                    ["Erro ao exportar", "Verifique se o arquivo Excel não está aberto em outro programa"],
+                    ["Login falhou", "Recadastre suas credenciais no módulo Credenciais"],
+                    ["Banco de dados corrompido", "Restaure um backup da pasta /backups"],
+                ]
+            )
+
+        # ------------------------------------------------------------------
+        # Montar sidebar com botões de seção
+        # ------------------------------------------------------------------
+        tk.Label(sidebar, text="SEÇÕES", bg=BG_CARD, fg=TEXTO_MUTED, font=("Arial", 8, "bold")).pack(anchor="w", padx=16, pady=(16, 8))
+
+        secoes = [
+            ("🏠  Visão Geral", _show_visao_geral),
+            ("📊  Dashboard", _show_dashboard),
+            ("🦅  Phoenix", _show_phoenix),
+            ("📋  Pegasus", _show_pegasus),
+            ("💰  Cost / Custo", _show_custo),
+            ("🔄  Ciclo de Vida", _show_ciclo_vida),
+            ("📤  Exportação", _show_exportacao),
+            ("🔑  Credenciais", _show_credenciais),
+            ("⚙️  Administração", _show_admin),
+            ("⚡  Atalhos e Dicas", _show_atalhos),
+        ]
+
+        sidebar_btns = []
+
+        def _selecionar(idx, fn):
+            for i, b in enumerate(sidebar_btns):
+                if i == idx:
+                    b.configure(bg=ACCENT, fg="#ffffff")
+                else:
+                    b.configure(bg=BG_CARD, fg=TEXTO)
+            fn()
+
+        for i, (texto, fn) in enumerate(secoes):
+            btn = tk.Button(
+                sidebar,
+                text=texto,
+                bg=BG_CARD,
+                fg=TEXTO,
+                activebackground=ACCENT,
+                activeforeground="#ffffff",
+                font=("Arial", 9, "bold"),
+                bd=0,
+                highlightthickness=0,
+                anchor="w",
+                padx=16,
+                pady=8,
+                cursor="hand2",
+                command=lambda idx=i, f=fn: _selecionar(idx, f),
+            )
+            btn.pack(fill="x")
+            sidebar_btns.append(btn)
+
+        # Footer da sidebar
+        tk.Frame(sidebar, bg=BORDA, height=1).pack(fill="x", padx=12, pady=(12, 8), side="bottom")
+        tk.Label(sidebar, text="v1.0 • Gabriel Girotto", bg=BG_CARD, fg=TEXTO_MUTED, font=("Arial", 7)).pack(side="bottom", pady=(0, 8))
+
+        # Mostrar primeira seção por padrão
+        _selecionar(0, _show_visao_geral)
+
+    def _executar_cost_manual(self):
+        """Executa a automação padrão do Cost Request (Abertura Manual)."""
+        cred = self._obter_ou_pedir_credencial("Cost")
+        if not cred or not cred.get("login") or not cred.get("senha"):
+            return
+
+        cred_user = cred["login"]
+        cred_pass = cred["senha"]
+
+        def _worker():
+            try:
+                from automocoes.cost.cost import nova_solicitacao_cost
+                os.environ["PHOENIX_CRED_USER"] = cred_user
+                os.environ["PHOENIX_CRED_PASS"] = cred_pass
+                nova_solicitacao_cost()
+            except Exception as exc:
+                logger.error("Erro ao executar Cost Request manual: %s", exc)
+
+        import threading
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _abrir_modal_cost_template(self):
+        """Abre o modal corporativo para envio de Cost Request via Template Excel."""
+        modal = tk.Toplevel(self.root)
+        modal.title("Open Request By Template - Cost Request")
+        modal.geometry("640x560")
+        modal.configure(bg=BG_CARD)
+        modal.transient(self.root)
+        modal.grab_set()
+
+        # Título do modal
+        header_frame = tk.Frame(modal, bg=BG_CARD, padx=20, pady=16)
+        header_frame.pack(fill="x")
+
+        tk.Label(
+            header_frame,
+            text="Open Request By Template",
+            bg=BG_CARD, fg=TEXTO, font=("Arial", 14, "bold")
+        ).pack(anchor="w")
+
+        tk.Label(
+            header_frame,
+            text="Selecione o Site/Company e anexe os arquivos de Template (.xlsx) e Cotação.",
+            bg=BG_CARD, fg=TEXTO_MUTED, font=("Arial", 9)
+        ).pack(anchor="w", pady=(2, 0))
+
+        tk.Frame(modal, bg=BORDA, height=1).pack(fill="x", padx=20)
+
+        body = tk.Frame(modal, bg=BG_CARD, padx=20, pady=16)
+        body.pack(fill="both", expand=True)
+
+        # Combo Site
+        tk.Label(body, text="Site *", bg=BG_CARD, fg=TEXTO, font=("Arial", 9, "bold")).pack(anchor="w", pady=(4, 2))
+        combo_site = ttk.Combobox(body, values=["JAGUARIUNA", "MANAUS", "SOROCABA", "OUTRO"], state="readonly")
+        combo_site.set("JAGUARIUNA")
+        combo_site.pack(fill="x", pady=(0, 10))
+
+        # Combo Company
+        tk.Label(body, text="Company *", bg=BG_CARD, fg=TEXTO, font=("Arial", 9, "bold")).pack(anchor="w", pady=(4, 2))
+        combo_company = ttk.Combobox(body, values=["361 - SITE JAGUARIUNA", "362 - SITE MANAUS", "OUTRO"], state="readonly")
+        combo_company.set("361 - SITE JAGUARIUNA")
+        combo_company.pack(fill="x", pady=(0, 10))
+
+        # Arquivo Template (.xlsx)
+        tk.Label(body, text="Arquivo Template (.xlsx) *", bg=BG_CARD, fg=TEXTO, font=("Arial", 9, "bold")).pack(anchor="w", pady=(4, 2))
+        row_temp = tk.Frame(body, bg=BG_CARD)
+        row_temp.pack(fill="x", pady=(0, 10))
+        entry_template = tk.Entry(row_temp, bg=ENTRY_BG, fg=TEXTO, relief="solid", bd=1, font=("Arial", 9))
+        entry_template.pack(side="left", fill="x", expand=True, padx=(0, 6))
+
+        def _selecionar_template():
+            caminho = filedialog.askopenfilename(
+                title="Selecionar Template Cost Request (.xlsx)",
+                filetypes=[("Planilha Excel", "*.xlsx"), ("Todos os arquivos", "*.*")]
+            )
+            if caminho:
+                entry_template.delete(0, "end")
+                entry_template.insert(0, caminho)
+
+        tk.Button(
+            row_temp, text="Buscar .xlsx", command=_selecionar_template,
+            bg=ACCENT, fg="#ffffff", activebackground=ACCENT_HOVER, activeforeground="#ffffff",
+            relief="flat", bd=0, font=("Arial", 8, "bold"), padx=10, cursor="hand2"
+        ).pack(side="right")
+
+        # Arquivo Quotation (PDF)
+        tk.Label(body, text="Arquivo de Cotação (PDF / E-mail)", bg=BG_CARD, fg=TEXTO, font=("Arial", 9, "bold")).pack(anchor="w", pady=(4, 2))
+        row_quot = tk.Frame(body, bg=BG_CARD)
+        row_quot.pack(fill="x", pady=(0, 16))
+        entry_quotation = tk.Entry(row_quot, bg=ENTRY_BG, fg=TEXTO, relief="solid", bd=1, font=("Arial", 9))
+        entry_quotation.pack(side="left", fill="x", expand=True, padx=(0, 6))
+
+        def _selecionar_cotacao():
+            caminho = filedialog.askopenfilename(
+                title="Selecionar Arquivo de Cotação",
+                filetypes=[("Documentos PDF / E-mail", "*.pdf;*.msg;*.eml"), ("Todos os arquivos", "*.*")]
+            )
+            if caminho:
+                entry_quotation.delete(0, "end")
+                entry_quotation.insert(0, caminho)
+
+        tk.Button(
+            row_quot, text="Buscar Cotação", command=_selecionar_cotacao,
+            bg=BG_CARD, fg=TEXTO, activebackground=BORDA, activeforeground=TEXTO,
+            relief="solid", bd=1, font=("Arial", 8, "bold"), padx=10, cursor="hand2"
+        ).pack(side="right")
+
+        # Barra de Progresso e Status
+        lbl_status = tk.Label(body, text="", bg=BG_CARD, fg=TEXTO_MUTED, font=("Arial", 9))
+        lbl_status.pack(anchor="w", pady=(0, 4))
+
+        progress = ttk.Progressbar(body, mode="indeterminate")
+
+        # Ações
+        footer = tk.Frame(modal, bg=BG_CARD, padx=20, pady=16)
+        footer.pack(fill="x", side="bottom")
+
+        def _download_template():
+            caminho_salvar = filedialog.asksaveasfilename(
+                title="Salvar Template Oficial Cost Request",
+                defaultextension=".xlsx",
+                initialfile="CostRequest_Template_Oficial.xlsx",
+                filetypes=[("Planilha Excel", "*.xlsx")]
+            )
+            if caminho_salvar:
+                try:
+                    from services.cost_template_service import gerar_template_oficial_excel
+                    gerar_template_oficial_excel(caminho_salvar)
+                    messagebox.showinfo("Download Concluído", f"Template gerado com sucesso em:\n{caminho_salvar}")
+                except Exception as exc:
+                    messagebox.showerror("Erro de Download", f"Não foi possível salvar o template:\n{exc}")
+
+        btn_download = tk.Button(
+            footer, text="Download Excel Template", command=_download_template,
+            bg=BG_CARD, fg=ACCENT, activebackground=BORDA, activeforeground=TEXTO,
+            relief="solid", bd=1, font=("Arial", 9, "bold"), padx=12, pady=6, cursor="hand2"
+        )
+        btn_download.pack(side="left")
+
+        def _processar_e_enviar():
+            site_val = combo_site.get().strip()
+            company_val = combo_company.get().strip()
+            temp_path = entry_template.get().strip()
+            quot_path = entry_quotation.get().strip()
+
+            if not site_val:
+                messagebox.showwarning("Campo Obrigatório", "Por favor, selecione o Site.")
+                return
+            if not company_val:
+                messagebox.showwarning("Campo Obrigatório", "Por favor, selecione a Company.")
+                return
+            if not temp_path:
+                messagebox.showwarning("Campo Obrigatório", "Por favor, anexe o arquivo de Template (.xlsx).")
+                return
+
+            from services.cost_template_service import validar_template_cost_request
+            valido, msg_val, registros_validos = validar_template_cost_request(temp_path)
+            if not valido:
+                messagebox.showerror("Validação do Template", msg_val)
+                return
+
+            lbl_status.config(text="Iniciando automação no portal...", fg=ACCENT)
+            progress.pack(fill="x", pady=(0, 10))
+            progress.start(10)
+            btn_processar.config(state="disabled")
+            btn_download.config(state="disabled")
+
+            def _worker():
+                try:
+                    from automocoes.cost.cost_template import executar_abertura_by_template
+                    from services.database import salvar_solicitacao_cost_template
+
+                    cred_usr = getattr(self, "usuario_atual", {}).get("nome", "") or "JAGGGIRO"
+                    cred_pass = ""
+
+                    res = executar_abertura_by_template(
+                        user=cred_usr,
+                        password=cred_pass,
+                        site=site_val,
+                        company=company_val,
+                        template_path=temp_path,
+                        quotation_path=quot_path,
+                        headless=False
+                    )
+
+                    def _on_finish():
+                        progress.stop()
+                        progress.pack_forget()
+                        btn_processar.config(state="normal")
+                        btn_download.config(state="normal")
+
+                        if res.get("sucesso"):
+                            tkt = res.get("ticket") or "TEMPLATE-AUT"
+                            salvar_solicitacao_cost_template(
+                                ticket=tkt,
+                                solicitante="Solicitante Cost Request",
+                                classificador=self.usuario_atual.get("nome", "Usuário") if hasattr(self, "usuario_atual") and isinstance(self.usuario_atual, dict) else "Usuário",
+                                site=site_val,
+                                company=company_val,
+                                registros_items=registros_validos
+                            )
+                            messagebox.showinfo("Sucesso", f"Cost Request aberto com sucesso!\nTicket: {tkt}")
+                            modal.destroy()
+                            self._abrir_dashboard()
+                        else:
+                            lbl_status.config(text="Falha na automação.", fg="#ff6b6b")
+                            messagebox.showerror("Erro na Automação", res.get("mensagem", "Falha desconhecida."))
+
+                    self.root.after(0, _on_finish)
+                except Exception as _exc:
+                    def _on_err():
+                        progress.stop()
+                        progress.pack_forget()
+                        btn_processar.config(state="normal")
+                        btn_download.config(state="normal")
+                        lbl_status.config(text="Erro no processamento.", fg="#ff6b6b")
+                        messagebox.showerror("Erro Inesperado", f"Ocorreu um erro no processamento:\n{_exc}")
+                    self.root.after(0, _on_err)
+
+            import threading
+            threading.Thread(target=_worker, daemon=True).start()
+
+        btn_processar = tk.Button(
+            footer, text="Processar & Enviar", command=_processar_e_enviar,
+            bg="#27ae60", fg="#ffffff", activebackground="#219653", activeforeground="#ffffff",
+            relief="flat", bd=0, font=("Arial", 9, "bold"), padx=14, pady=6, cursor="hand2"
+        )
+        btn_processar.pack(side="right")
 
 
 def _tratar_excecao_global(exc_type, exc_value, exc_traceback):
